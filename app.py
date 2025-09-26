@@ -1,7 +1,5 @@
 from flask import Flask, request, Response
 from dotenv import load_dotenv
-from google.cloud import texttospeech
-from google.oauth2 import service_account
 from twilio.twiml.voice_response import VoiceResponse, Gather
 import openai
 import os
@@ -11,6 +9,23 @@ from urllib.parse import urljoin
 import traceback
 import threading
 import time
+
+# --- ייבוא מוגן (Critical Fix) ---
+# הייבוא הזה הוא החשוד העיקרי לקריסת 502 ב-Railway.
+try:
+    from google.cloud import texttospeech
+    from google.oauth2 import service_account
+    TTS_AVAILABLE = True
+    print("✅ Google TTS modules loaded successfully.")
+except ImportError as e:
+    TTS_AVAILABLE = False
+    print(f"❌ Critical Import Error for Google TTS: {e}")
+    print("TTS functionality will be disabled. Check requirements.txt and Railway environment.")
+except Exception as e:
+    TTS_AVAILABLE = False
+    print(f"❌ General error during Google TTS import: {e}")
+    print("TTS functionality will be disabled.")
+# -----------------------------------
 
 print("🚀 Flask app is loading...")
 
@@ -25,15 +40,13 @@ app = Flask(__name__)
 session_memory = {}
 
 # הגנה מפני קריסה: ודא שספריית ה-static קיימת לפני כתיבת קבצים.
-# השינוי העיקרי: exist_ok=True ובלוק try/except מוגן.
 STATIC_DIR = os.path.join(os.getcwd(), 'static')
 try:
+    # השימוש ב-exist_ok=True מגן מפני קריסה אם התיקייה כבר קיימת.
     os.makedirs(STATIC_DIR, exist_ok=True)
     print(f"📁 Ensured static directory exists at: {STATIC_DIR}")
 except Exception as e:
-    # הקריסה המיידית ב-Railway מגיעה לרוב מכאן, אנחנו רוצים להתעלם ממנה אם אפשר.
     print(f"❌ Failed to ensure static directory exists: {e}")
-    # ממשיכים, למרות השגיאה, בתקווה שזה לא יפיל את ה-Worker
 
 # משתני API (נטענים ברמת המודול)
 print("🔑 Checking env variables...")
@@ -41,6 +54,7 @@ openai.api_key = os.getenv("OPENAI_API_KEY")
 if openai.api_key:
     print("OPENAI_API_KEY loaded: ✅")
 else:
+    # אם זה חסר, Twilio/GPT לא יעבדו, אבל זה לא אמור להפיל את השרת
     print("❌ Missing OPENAI_API_KEY")
 
 google_creds_json = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON")
@@ -54,6 +68,9 @@ else:
 
 def get_tts_client():
     """מאתחל ומחזיר את לקוח Google Text-to-Speech."""
+    if not TTS_AVAILABLE:
+        raise RuntimeError("Google TTS modules failed to load at startup.")
+        
     # הגנה: מוודא שהמשתנה קיים לפני ניסיון הפיענוח
     if not google_creds_json:
         raise EnvironmentError("Missing Google TTS credentials (JSON string).")
@@ -64,6 +81,7 @@ def get_tts_client():
         return texttospeech.TextToSpeechClient(credentials=credentials)
     except Exception as e:
         print(f"❌ Google TTS init failed during client creation: {e}")
+        # במקרה של שגיאת יצירת לקוח, נשתמש ב-TTS של Twilio כ-Fallback.
         raise
 
 
@@ -97,6 +115,7 @@ def twilio_answer():
         
         response = VoiceResponse()
 
+        # אם ה-TTS נכשל, עדיין נשמיע את ההודעה באמצעות say המובנה של Twilio
         gather = Gather(
             input='speech',
             action='/twilio/process',
@@ -151,51 +170,65 @@ def twilio_process():
         messages.append({"role": "user", "content": user_input})
         
         # --- קריאה ל-OpenAI ---
-        gpt_response = openai.ChatCompletion.create(
-            model="gpt-3.5-turbo",
-            messages=messages,
-            max_tokens=150,
-            temperature=0.7
-        )
-        bot_text = gpt_response.choices[0].message.content.strip()
+        if not openai.api_key:
+            bot_text = "אני מצטער, מפתח ה-OpenAI חסר. לא ניתן לעבד את בקשתך."
+        else:
+            gpt_response = openai.ChatCompletion.create(
+                model="gpt-3.5-turbo",
+                messages=messages,
+                max_tokens=150,
+                temperature=0.7
+            )
+            bot_text = gpt_response.choices[0].message.content.strip()
+        
         print("🤖 GPT says:", bot_text)
 
         # עדכון זיכרון השיחה
         messages.append({"role": "assistant", "content": bot_text})
         session_memory[call_sid] = messages
 
-        # --- יצירת אודיו (Google TTS) ---
-        tts_client = get_tts_client()
-        synthesis_input = texttospeech.SynthesisInput(text=bot_text)
-        voice = texttospeech.VoiceSelectionParams(
-            language_code="he-IL",
-            ssml_gender=texttospeech.SsmlVoiceGender.NEUTRAL
-        )
-        audio_config = texttospeech.AudioConfig(
-            audio_encoding=texttospeech.AudioEncoding.LINEAR16,
-            sample_rate_hertz=8000 
-        )
-        response_tts = tts_client.synthesize_speech(
-            input=synthesis_input,
-            voice=voice,
-            audio_config=audio_config
-        )
-
-        # --- שמירת קובץ ומחיקה ---
-        unique_id = str(uuid.uuid4())
-        output_path = os.path.join(STATIC_DIR, f"output_{unique_id}.wav") 
-        with open(output_path, "wb") as out:
-            out.write(response_tts.audio_content)
-            
-        delete_file_later(output_path, delay=30) 
-
-        # יצירת URL ציבורי
-        wav_url = urljoin(request.host_url, f"static/output_{unique_id}.wav")
-        print(f"🔊 Playing audio: {wav_url}")
-
         # --- יצירת תגובת TwiML ---
         response = VoiceResponse()
-        response.play(wav_url) 
+        
+        if TTS_AVAILABLE and google_creds_json:
+            # --- יצירת אודיו (Google TTS) ---
+            try:
+                tts_client = get_tts_client()
+                synthesis_input = texttospeech.SynthesisInput(text=bot_text)
+                voice = texttospeech.VoiceSelectionParams(
+                    language_code="he-IL",
+                    ssml_gender=texttospeech.SsmlVoiceGender.NEUTRAL
+                )
+                audio_config = texttospeech.AudioConfig(
+                    audio_encoding=texttospeech.AudioEncoding.LINEAR16,
+                    sample_rate_hertz=8000 
+                )
+                response_tts = tts_client.synthesize_speech(
+                    input=synthesis_input,
+                    voice=voice,
+                    audio_config=audio_config
+                )
+
+                # --- שמירת קובץ ומחיקה ---
+                unique_id = str(uuid.uuid4())
+                output_path = os.path.join(STATIC_DIR, f"output_{unique_id}.wav") 
+                with open(output_path, "wb") as out:
+                    out.write(response_tts.audio_content)
+                    
+                delete_file_later(output_path, delay=30) 
+
+                # יצירת URL ציבורי
+                wav_url = urljoin(request.host_url, f"static/output_{unique_id}.wav")
+                print(f"🔊 Playing audio: {wav_url}")
+                response.play(wav_url) 
+                
+            except Exception as e:
+                print(f"❌ Failed to generate or play Google TTS audio: {e}. Falling back to Twilio say.")
+                response.say(bot_text, language='he-IL')
+        else:
+            # Fallback ל-TTS המובנה של Twilio
+            response.say(bot_text, language='he-IL')
+
 
         # ממשיך את לולאת השיחה
         gather = Gather(

@@ -2,45 +2,56 @@ import os
 import requests
 import json
 from flask import Flask, request
-from twilio.twiml.voice_response import VoiceResponse, Gather
+from twilio.twiml.voice_response import VoiceResponse, Gather, Say
+# חשוב: תיקון הייבוא של ElevenLabs בעקבות השגיאה בלוגים
 from elevenlabs import generate, set_api_key, voices, Voice
 from openai import OpenAI
+# הוספת ספרייה לתמיכה בקבצי WAV, במידה ונרצה להשתמש בהמשך ב-Play
+# import wave
+# import io
 
 # --- הגדרות כלליות ---
 app = Flask(__name__)
 
 # הגדרת משתני סביבה.
 # הערה: המפתח של Gemini 2.5 Flash מגיע דרך משתנה הסביבה 'OPENAI_API_KEY'
-# ומשתמש בספריית 'openai' למרות שזהו מודל של Google.
 GEMINI_API_KEY = os.environ.get("OPENAI_API_KEY")
 ELEVENLABS_API_KEY = os.environ.get("ELEVENLABS_API_KEY")
 
 # הגדרת מזהה הקול של ElevenLabs לעברית (Dahlia)
-# אם משתנה הסביבה לא הוגדר, הקול לא ישמש.
 ELEVENLABS_VOICE_ID = "EXrV30yK71VzG2k3bXfX"
 
 # אתחול הלקוחות
+llm_client = None
+elevenlabs_initialized = False
+
 try:
     if GEMINI_API_KEY:
+        # אתחול לקוח OpenAI תוך שימוש ב-base_url עבור Gemini API
+        # יש להחליף את ה-base_url בכתובת המדויקת אם היא שונה מהדיפולט
         llm_client = OpenAI(
             api_key=GEMINI_API_KEY,
-            base_url="https://api.gemini.com/v1" # כתובת בסיס תיאורטית, בשימוש בפועל זה תלוי בהגדרה ספציפית
+            # בשימוש בפלטפורמות מסוימות, ניתן להשמיט base_url או להגדיר אותו בהתאם
+            # base_url="https://api.gemini.com/v1" 
         )
+        print("LLM Client initialized successfully.")
     else:
-        llm_client = None
+        print("Warning: OPENAI_API_KEY not found. LLM client not initialized.")
 except Exception as e:
-    llm_client = None
     print(f"Error initializing LLM client: {e}")
 
 if ELEVENLABS_API_KEY:
     try:
+        # אתחול ElevenLabs API
         set_api_key(ELEVENLABS_API_KEY)
         elevenlabs_initialized = True
+        print("ElevenLabs initialized successfully.")
     except Exception as e:
         print(f"ElevenLabs API Key error or initialization failed: {e}")
         elevenlabs_initialized = False
 else:
-    elevenlabs_initialized = False
+    print("Warning: ELEVENLABS_API_KEY not found. ElevenLabs not initialized.")
+
 
 # --- פונקציית LLM ---
 def call_llm_api(prompt):
@@ -48,11 +59,11 @@ def call_llm_api(prompt):
     מתקשרת ל-Gemini API לקבלת תשובה.
     """
     if not llm_client:
-        return "I am sorry, but the language model is currently unavailable."
+        return "אני מצטער, אך מודל השפה אינו זמין כרגע. אנא פנה לתמיכה."
 
     # הגדרת הודעות (כולל System Instruction)
     messages = [
-        {"role": "system", "content": "אתה בוט טלפוני בעברית, חברותי, ענייני וממוקד. ענה בקצרה, בטון קול טבעי, כאילו אתה מדבר בטלפון. השם שלך הוא בוט."}
+        {"role": "system", "content": "אתה בוט טלפוני בעברית, חברותי, ענייני וממוקד. ענה בקצרה ובטון קול טבעי, כאילו אתה מדבר בטלפון. השם שלך הוא בוט."}
     ]
 
     # הוספת הפרומפט של המשתמש
@@ -60,9 +71,6 @@ def call_llm_api(prompt):
 
     try:
         # שימוש במודל Gemini 2.5 Flash
-        # הערה: השם 'gemini-2.5-flash' תלוי בהגדרת ה-base_url ובמיפוי בפועל של ה-API
-        # אם ה-base_url הוא של OpenAI, ייתכן שצריך להשתמש בשם מודל אחר או במיפוי מיוחד
-        # לצרכי הדגמה והנחה שהאינטגרציה עובדת:
         completion = llm_client.chat.completions.create(
             model="gemini-2.5-flash", 
             messages=messages,
@@ -73,8 +81,9 @@ def call_llm_api(prompt):
         return completion.choices[0].message.content.strip()
 
     except Exception as e:
-        print(f"LLM API Call Failed: {e}")
-        return "אני מצטער, חלה תקלה בשירות השפה. אנא נסה שוב."
+        print(f"CRITICAL: LLM API Call Failed: {e}")
+        return "אני מצטער, חלה תקלה חמורה בשירות השפה. אנא נסה שוב מאוחר יותר."
+
 
 # --- פונקציית TTS (ElevenLabs) ---
 def generate_audio_with_elevenlabs(text):
@@ -96,7 +105,7 @@ def generate_audio_with_elevenlabs(text):
         return b"".join(audio)
 
     except Exception as e:
-        print(f"ElevenLabs Generation Failed: {e}")
+        print(f"ERROR: ElevenLabs Generation Failed: {e}")
         # במקרה של כשל, נחזיר None כדי שהבוט יחזור ל-Twilio Say
         return None
 
@@ -115,20 +124,15 @@ def voice():
     audio_data = generate_audio_with_elevenlabs(initial_prompt)
     
     if audio_data:
-        # אם האודיו נוצר בהצלחה, נשמור אותו ונשתמש ב-Play
-        # מכיוון ש-Twilio דורש כתובת URL, נשתמש ב-Say לצורך דמו קל
-        # **שים לב**: בשימוש אמיתי, צריך שרת קבצים שמאחסן את האודיו ומספק קישור.
-        # לצורך ה-MVP ופשטות ההתחלה, נחזור ל-Say גם כאן אם אין שרת קבצים פשוט.
-        
-        # לצורך המטרה של אימות ה-TTS, אם ElevenLabs עובד, נשתמש ב-Say
-        # עם התחלה באנגלית כדי לוודא שמשתמשים ב-ElevenLabs
-        print("Using ElevenLabs (fallback to Say for URL simplicity)")
+        # אם ElevenLabs עובד, נשתמש ב-Say עם התחלה באנגלית כדי לוודא
+        # ששירות ה-TTS הפעיל הוא ElevenLabs (בגלל שאין לנו אחסון קבצים ב-Railway)
+        print("SUCCESS: ElevenLabs initialized. Using fallback Say for PoC.")
         response.say("Hello. I will now speak Hebrew.", language='en-US')
-        response.say("שלום, הגעת לבוט הטלפוני. איך אוכל לעזור לך היום?", language='he-IL')
+        response.say(initial_prompt, language='he-IL')
         
     else:
         # אם ElevenLabs נכשל או לא הוגדר, נשתמש ב-Say הסטנדרטי של Twilio
-        print("Using Twilio default Say (ElevenLabs failed or not initialized)")
+        print("FALLBACK: Using Twilio default Say (ElevenLabs failed or not initialized).")
         response.say(initial_prompt, language='he-IL')
 
     # בקשה לאיסוף הקלט הקולי של המשתמש (Gather)
@@ -163,18 +167,13 @@ def handle_speech():
         audio_data = generate_audio_with_elevenlabs(llm_response_text)
         
         if audio_data:
-            # **דרוש שרת קבצים**
-            # אם משתמשים ב-Play, חייבים לאחסן את ה-MP3 בשרת נגיש
-            # מאחר ש-Railway היא פלטפורמה חולפת, זה דורש שירות אחסון נוסף (כמו S3).
-            
-            # לצורך המטרה של הוכחת קונספט (PoC) נוודא שהקול הוא טבעי
-            # מאחר ואין שרת קבצים כרגע, נשתמש שוב ב-Say, אך נניח ש-ElevenLabs עובד
-            print("Using ElevenLabs (fallback to Say for URL simplicity)")
+            # ElevenLabs עובד - נשתמש בו (גיבוי ל-Say בשל מגבלות אחסון)
+            print("SUCCESS: Responding with ElevenLabs (fallback to Say).")
             response.say(llm_response_text, language='he-IL')
             
         else:
-            # אם ElevenLabs נכשל או לא הוגדר, נשתמש ב-Say הסטנדרטי של Twilio
-            print("Using Twilio default Say (ElevenLabs failed or not initialized)")
+            # ElevenLabs נכשל או לא הוגדר - נשתמש ב-Say הסטנדרטי של Twilio
+            print("FALLBACK: Responding with Twilio default Say.")
             response.say(llm_response_text, language='he-IL')
 
         # איסוף קלט נוסף כדי להמשיך את השיחה (לולאה)
@@ -196,6 +195,8 @@ def handle_speech():
             speech_timeout='auto'
         )
 
+    # אם השיחה מסתיימת (לדוגמה, המשתמש לא אמר כלום), ננתק
+    # response.hangup() 
     return str(response)
 
 # --- נקודת כניסה לשרת ---

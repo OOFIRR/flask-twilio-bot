@@ -8,6 +8,8 @@ import os
 import json
 import uuid
 from urllib.parse import urljoin
+print("🚀 Flask app is loading...")
+
 
 # Load local .env if running locally (ignored on Railway)
 load_dotenv(dotenv_path='env/.env')

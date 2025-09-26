@@ -9,31 +9,38 @@ import json
 import uuid
 from urllib.parse import urljoin
 
-# Load environment variables
+# Load local .env if running locally (ignored on Railway)
 load_dotenv(dotenv_path='env/.env')
 
 # Init Flask
 app = Flask(__name__)
 
-# Set OpenAI API key
+# OpenAI API Key
 openai.api_key = os.getenv("OPENAI_API_KEY")
 
-# Load Google TTS credentials from environment variable
-google_creds_json = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON")
-if not google_creds_json:
-    raise RuntimeError("Missing GOOGLE_APPLICATION_CREDENTIALS_JSON environment variable.")
-credentials = service_account.Credentials.from_service_account_info(json.loads(google_creds_json))
-tts_client = texttospeech.TextToSpeechClient(credentials=credentials)
+# === Helper: Create TTS client on demand === #
+def get_tts_client():
+    google_creds_json = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON")
+    if not google_creds_json:
+        raise RuntimeError("Missing GOOGLE_APPLICATION_CREDENTIALS_JSON environment variable.")
+    
+    try:
+        credentials_dict = json.loads(google_creds_json)
+        credentials = service_account.Credentials.from_service_account_info(credentials_dict)
+        return texttospeech.TextToSpeechClient(credentials=credentials)
+    except Exception as e:
+        print("❌ Google TTS init failed:", e)
+        raise
 
 
-# === ROUTES === #
+# === Routes === #
 
 @app.route("/twilio/answer", methods=["POST"])
 def twilio_answer():
-    """Initial webhook when call connects - plays a greeting and waits for input"""
-    print("📞 נכנסה שיחה חדשה /twilio/answer")
-
+    """Initial webhook when call connects"""
+    print("📞 שיחה נכנסה /twilio/answer")
     response = VoiceResponse()
+
     gather = Gather(
         input='speech',
         action='/twilio/process',
@@ -42,6 +49,7 @@ def twilio_answer():
         speech_timeout='auto'
     )
     gather.say("שלום! איך אפשר לעזור לך היום?", language='he-IL')
+
     response.append(gather)
     response.say("לא קיבלתי תשובה. להתראות!", language='he-IL')
 
@@ -50,8 +58,8 @@ def twilio_answer():
 
 @app.route("/twilio/process", methods=["POST"])
 def twilio_process():
-    """Process user's speech and return GPT response as audio"""
-    print("🛠️ התקבלה בקשה ל־/twilio/process")
+    """Process speech input and respond with audio"""
+    print("🛠️ בקשה ל־/twilio/process")
 
     user_input = request.form.get('SpeechResult')
     if not user_input:
@@ -80,34 +88,36 @@ def twilio_process():
     bot_text = gpt_response.choices[0].message.content
     print("🤖 תשובת GPT:", bot_text)
 
-    # Convert GPT response to Hebrew WAV audio
+    # Synthesize speech with Google TTS (WAV)
+    tts_client = get_tts_client()
     synthesis_input = texttospeech.SynthesisInput(text=bot_text)
     voice = texttospeech.VoiceSelectionParams(
         language_code="he-IL",
         ssml_gender=texttospeech.SsmlVoiceGender.NEUTRAL
     )
     audio_config = texttospeech.AudioConfig(
-        audio_encoding=texttospeech.AudioEncoding.LINEAR16,  # WAV format
-        sample_rate_hertz=8000  # recommended for telephony
+        audio_encoding=texttospeech.AudioEncoding.LINEAR16,
+        sample_rate_hertz=8000  # good for telephony
     )
+
     response_tts = tts_client.synthesize_speech(
         input=synthesis_input,
         voice=voice,
         audio_config=audio_config
     )
 
-    # Save audio to unique WAV file
+    # Save WAV file with unique name
     unique_id = str(uuid.uuid4())
     output_path = f"static/output_{unique_id}.wav"
     with open(output_path, "wb") as out:
         out.write(response_tts.audio_content)
 
-    # Respond with TwiML to play the WAV file
+    # TwiML response
     response = VoiceResponse()
     wav_url = urljoin(request.host_url, f"static/output_{unique_id}.wav")
     response.play(wav_url)
 
-    # Continue conversation
+    # Follow-up question
     gather = Gather(
         input='speech',
         action='/twilio/process',
@@ -123,10 +133,10 @@ def twilio_process():
 
 @app.route("/", methods=["GET"])
 def index():
-    return "✅ Flask server is running!"
+    return "✅ Flask server is running on Railway!"
 
 
-# === Run the app === #
+# === Run App === #
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(debug=True, host="0.0.0.0", port=port)

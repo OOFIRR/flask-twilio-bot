@@ -4,10 +4,8 @@ import json
 from flask import Flask, request
 from twilio.twiml.voice_response import VoiceResponse, Gather
 
-# --- תיקון ייבוא ElevenLabs לשימוש ב-Client Object ---
-# אנו מייבאים רק את המחלקה ElevenLabs
+# ייבוא יציב של ElevenLabs באמצעות Client
 from elevenlabs.client import ElevenLabs 
-# set_api_key ו-Voice אינם נחוצים לייבוא ישיר יותר, מה שמונע קריסות
 
 from openai import OpenAI
 
@@ -21,14 +19,15 @@ ELEVENLABS_API_KEY = os.environ.get("ELEVENLABS_API_KEY")
 # הגדרת מזהה הקול של ElevenLabs לעברית (Dahlia)
 ELEVENLABS_VOICE_ID = "EXrV30yK71VzG2k3bXfX"
 ELEVENLABS_MODEL = "eleven_multilingual_v2" 
+HEBREW_LANGUAGE_CODE = "he-IL" # קוד שפה תקני לעברית
 
 # אתחול הלקוחות
 try:
     if GEMINI_API_KEY:
-        # אתחול לקוח LLM (Gemini 2.5 Flash)
+        # אתחול לקוח LLM (Gemini 2.5 Flash - כתובת בסיס תיאורטית)
         llm_client = OpenAI(
             api_key=GEMINI_API_KEY,
-            base_url="https://api.gemini.com/v1" # כתובת בסיס תיאורטית, בשימוש בפועל זה תלוי בהגדרה ספציפית
+            base_url="https://api.gemini.com/v1"
         )
     else:
         llm_client = None
@@ -41,7 +40,7 @@ elevenlabs_initialized = False
 
 try:
     if ELEVENLABS_API_KEY:
-        # אתחול לקוח ElevenLabs. הסרת set_api_key, מאחר שהמפתח עובר ישירות ל-Client.
+        # אתחול לקוח ElevenLabs. 
         elevenlabs_client = ElevenLabs(api_key=ELEVENLABS_API_KEY)
         elevenlabs_initialized = True
         print("ElevenLabs client initialized successfully.")
@@ -82,20 +81,17 @@ def call_llm_api(prompt):
 def generate_audio_with_elevenlabs(text):
     """
     מנסה לייצר אודיו בעברית באמצעות ElevenLabs תוך שימוש באובייקט הלקוח.
-    מחזירה את האודיו בפורמט MP3 כבייטים, או None אם נכשל.
     """
     if not elevenlabs_initialized or not elevenlabs_client:
         return None
 
     try:
-        # שימוש בשיטת ה-Client במקום בפונקציית generate הגלובלית
         audio = elevenlabs_client.generate(
             text=text,
             voice=ELEVENLABS_VOICE_ID,
             model=ELEVENLABS_MODEL
         )
         
-        # ElevenLabs מחזירה איטרטור, נחבר אותו לבייטס אחד
         return b"".join(audio)
 
     except Exception as e:
@@ -116,23 +112,21 @@ def voice():
     audio_data = generate_audio_with_elevenlabs(initial_prompt)
     
     if audio_data:
-        # אם האודיו נוצר בהצלחה
+        # אם ElevenLabs עובד, אנו נשלח קודם קול אנגלי ואז עברית (כיוון שאי אפשר לשלוח קובץ אודיו ישירות)
         print("Using ElevenLabs (fallback to Say for URL simplicity)")
-        # שימוש ב-Say כדי לוודא שה-TTS עובד, מכיוון שאין לנו שרת אחסון קבצים
-        # הקול האנגלי רק כדי לסמן הצלחה ברורה של ה-TTS API
         response.say("Hello. I will now speak Hebrew.", language='en-US')
-        response.say(initial_prompt, language='he-IL')
+        response.say(initial_prompt, language=HEBREW_LANGUAGE_CODE)
         
     else:
-        # אם ElevenLabs נכשל או לא הוגדר, נשתמש ב-Say הסטנדרטי של Twilio
+        # אם ElevenLabs נכשל, נשתמש ב-Say הסטנדרטי של Twilio
         print("Using Twilio default Say (ElevenLabs failed or not initialized)")
-        response.say(initial_prompt, language='he-IL')
+        response.say(initial_prompt, language=HEBREW_LANGUAGE_CODE)
 
     # בקשה לאיסוף הקלט הקולי של המשתמש (Gather)
     response.gather(
         input='speech',
         action='/handle_speech',
-        language='he-IL',
+        language=HEBREW_LANGUAGE_CODE,
         speech_timeout='auto'
     )
     
@@ -159,27 +153,27 @@ def handle_speech():
         
         if audio_data:
             print("Using ElevenLabs (fallback to Say for URL simplicity)")
-            response.say(llm_response_text, language='he-IL')
+            response.say(llm_response_text, language=HEBREW_LANGUAGE_CODE)
             
         else:
-            # אם ElevenLabs נכשל או לא הוגדר, נשתמש ב-Say הסטנדרטי של Twilio
+            # אם ElevenLabs נכשל, נשתמש ב-Say הסטנדרטי של Twilio
             print("Using Twilio default Say (ElevenLabs failed or not initialized)")
-            response.say(llm_response_text, language='he-IL')
+            response.say(llm_response_text, language=HEBREW_LANGUAGE_CODE)
 
         # איסוף קלט נוסף כדי להמשיך את השיחה (לולאה)
         response.gather(
             input='speech',
             action='/handle_speech',
-            language='he-IL',
+            language=HEBREW_LANGUAGE_CODE,
             speech_timeout='auto'
         )
         
     else:
-        response.say("לא שמעתי אותך. תוכל לחזור על דבריך?", language='he-IL')
+        response.say("לא שמעתי אותך. תוכל לחזור על דבריך?", language=HEBREW_LANGUAGE_CODE)
         response.gather(
             input='speech',
             action='/handle_speech',
-            language='he-IL',
+            language=HEBREW_LANGUAGE_CODE,
             speech_timeout='auto'
         )
 

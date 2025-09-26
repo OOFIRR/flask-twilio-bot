@@ -63,11 +63,15 @@ def index():
         return "Internal Error", 500
 
 # === Route: Twilio call entry === #
-@app.route("/twilio/answer", methods=["POST", "OPTIONS"])
+@app.route("/twilio/answer", methods=["GET", "POST", "OPTIONS"])
 def twilio_answer():
     if request.method == "OPTIONS":
         print("🔧 Received OPTIONS request on /twilio/answer")
         return Response(status=200)
+
+    if request.method == "GET":
+        print("🌐 GET request to /twilio/answer — not allowed for Twilio")
+        return make_response("This endpoint expects POST requests from Twilio.", 200)
 
     print("📞 שיחה נכנסה /twilio/answer")
 

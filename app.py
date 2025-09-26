@@ -12,7 +12,14 @@ app = Flask(__name__)
 
 # Set your API keys
 openai.api_key = os.getenv("OPENAI_API_KEY")
-os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "long-ceiling-459419-j7-...json"  # Adjust filename if needed
+import json
+from google.oauth2 import service_account
+
+google_creds_json = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON")
+
+credentials = service_account.Credentials.from_service_account_info(json.loads(google_creds_json))
+tts_client = texttospeech.TextToSpeechClient(credentials=credentials)
+
 
 # === ROUTES === #
 

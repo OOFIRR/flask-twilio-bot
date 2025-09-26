@@ -1,4 +1,4 @@
-from flask import Flask, request, Response, make_response
+from flask import Flask, request, Response
 from dotenv import load_dotenv
 from google.cloud import texttospeech
 from google.oauth2 import service_account
@@ -22,14 +22,18 @@ load_dotenv(dotenv_path='env/.env')
 app = Flask(__name__)
 
 # זיכרון שיחה זמני (In-memory session context). 
-# הערה: יש להחליף ב-Redis/Firestore לסביבת פרודקשן אמיתית.
 session_memory = {}
 
-# ודא שספריית ה-static קיימת (חשוב במיוחד לסביבות ענן כמו Railway!)
+# הגנה מפני קריסה: ודא שספריית ה-static קיימת לפני כתיבת קבצים.
+# השינוי העיקרי: exist_ok=True ובלוק try/except מוגן.
 STATIC_DIR = os.path.join(os.getcwd(), 'static')
-if not os.path.exists(STATIC_DIR):
-    os.makedirs(STATIC_DIR)
-    print(f"📁 Created static directory at: {STATIC_DIR}")
+try:
+    os.makedirs(STATIC_DIR, exist_ok=True)
+    print(f"📁 Ensured static directory exists at: {STATIC_DIR}")
+except Exception as e:
+    # הקריסה המיידית ב-Railway מגיעה לרוב מכאן, אנחנו רוצים להתעלם ממנה אם אפשר.
+    print(f"❌ Failed to ensure static directory exists: {e}")
+    # ממשיכים, למרות השגיאה, בתקווה שזה לא יפיל את ה-Worker
 
 # משתני API (נטענים ברמת המודול)
 print("🔑 Checking env variables...")
@@ -57,11 +61,9 @@ def get_tts_client():
     try:
         credentials_dict = json.loads(google_creds_json)
         credentials = service_account.Credentials.from_service_account_info(credentials_dict)
-        # הלקוח נוצר כאן (בתוך ה-request)
         return texttospeech.TextToSpeechClient(credentials=credentials)
     except Exception as e:
-        print(f"❌ Google TTS init failed: {e}")
-        # אם יש שגיאה, נזרק אותה כדי שה-try/except בראוט יתפוס
+        print(f"❌ Google TTS init failed during client creation: {e}")
         raise
 
 
@@ -73,10 +75,8 @@ def delete_file_later(path, delay=30):
             os.remove(path)
             print(f"🗑️ Deleted file: {path}")
         except Exception as e:
-            # מתעלם משגיאות מחיקה שקטות
             print(f"❌ Failed to delete file {path}:", e)
     
-    # מפעיל את המחיקה ב-thread נפרד כדי לא לחסום את התגובה ל-Twilio
     threading.Thread(target=_delete).start()
 
 
@@ -86,7 +86,6 @@ def delete_file_later(path, delay=30):
 def index():
     """ראוט בדיקת חיים (Health Check)."""
     print("✅ GET / called")
-    # תשובה תקינה (200) מוודאת שהשרת רץ ונגיש
     return "✅ Flask server is running on Railway!"
 
 
@@ -98,10 +97,9 @@ def twilio_answer():
         
         response = VoiceResponse()
 
-        # Gather: מתחיל האזנה לקול המשתמש
         gather = Gather(
             input='speech',
-            action='/twilio/process',  # הולך לראוט שמטפל בתשובה
+            action='/twilio/process',
             method='POST',
             language='he-IL',
             speech_timeout='auto'
@@ -109,11 +107,9 @@ def twilio_answer():
         gather.say("שלום! איך אפשר לעזור לך היום?", language='he-IL')
         response.append(gather)
         
-        # Fallback אם המשתמש לא אומר כלום
         response.say("לא קיבלתי תשובה. להתראות!", language='he-IL')
 
         xml_str = str(response)
-        # מוודא שה-headers מוגדרים נכון עבור Twilio
         return Response(xml_str, status=200, mimetype='application/xml', headers={"Content-Type": "text/xml"})
 
     except Exception as e:
@@ -128,7 +124,6 @@ def twilio_process():
     try:
         print("🛠️ Request to /twilio/process")
         
-        # שולף את הקלט ואת מזהה השיחה (CallSid)
         user_input = request.form.get('SpeechResult')
         call_sid = request.form.get('CallSid')
 
@@ -137,7 +132,6 @@ def twilio_process():
             print("⚠️ No speech input")
             response = VoiceResponse()
             response.say("לא שמעתי אותך. תוכל לנסות שוב?", language='he-IL')
-            # מתחיל Gather מחדש
             gather = Gather(
                 input='speech',
                 action='/twilio/process',
@@ -153,15 +147,13 @@ def twilio_process():
         print("🗣️ User said:", user_input)
 
         # --- ניהול זיכרון שיחה (Session Management) ---
-        # טוען היסטוריה או מתחיל חדשה
         messages = session_memory.get(call_sid, [])
-        # הוסף את הודעת המשתמש הנוכחית
         messages.append({"role": "user", "content": user_input})
         
         # --- קריאה ל-OpenAI ---
         gpt_response = openai.ChatCompletion.create(
             model="gpt-3.5-turbo",
-            messages=messages,  # שולח את כל ההיסטוריה
+            messages=messages,
             max_tokens=150,
             temperature=0.7
         )
@@ -180,7 +172,6 @@ def twilio_process():
             ssml_gender=texttospeech.SsmlVoiceGender.NEUTRAL
         )
         audio_config = texttospeech.AudioConfig(
-            # הגדרות קריטיות: 8kHz, LINEAR16, נדרש ל-Twilio Play
             audio_encoding=texttospeech.AudioEncoding.LINEAR16,
             sample_rate_hertz=8000 
         )
@@ -192,11 +183,10 @@ def twilio_process():
 
         # --- שמירת קובץ ומחיקה ---
         unique_id = str(uuid.uuid4())
-        output_path = os.path.join(STATIC_DIR, f"output_{unique_id}.wav") # משתמש ב-STATIC_DIR
+        output_path = os.path.join(STATIC_DIR, f"output_{unique_id}.wav") 
         with open(output_path, "wb") as out:
             out.write(response_tts.audio_content)
             
-        # מפעיל מחיקה לאחר 30 שניות
         delete_file_later(output_path, delay=30) 
 
         # יצירת URL ציבורי
@@ -205,7 +195,7 @@ def twilio_process():
 
         # --- יצירת תגובת TwiML ---
         response = VoiceResponse()
-        response.play(wav_url) # מנגן את התשובה
+        response.play(wav_url) 
 
         # ממשיך את לולאת השיחה
         gather = Gather(
@@ -231,5 +221,4 @@ def twilio_process():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    # Note: Gunicorn הוא זה שמפעיל בפועל את האפליקציה ב-Railway.
     app.run(debug=True, host="0.0.0.0", port=port)

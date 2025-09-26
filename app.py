@@ -13,7 +13,7 @@ import traceback
 
 print("🚀 Flask app is loading...")
 
-# Load local .env file (ignored on Railway)
+# Load local .env file (for local dev only)
 load_dotenv(dotenv_path='env/.env')
 
 # === Debug: Check env variables === #
@@ -26,6 +26,7 @@ print("GOOGLE_APPLICATION_CREDENTIALS_JSON length:", len(google_creds) if google
 
 # Init Flask
 app = Flask(__name__)
+print("📡 Flask app is live and routes are registered.")
 
 # === Global error handler === #
 @app.errorhandler(Exception)
@@ -62,11 +63,15 @@ def index():
         return "Internal Error", 500
 
 # === Route: Twilio call entry === #
-@app.route("/twilio/answer", methods=["POST"])
+@app.route("/twilio/answer", methods=["POST", "OPTIONS"])
 def twilio_answer():
-    print("📞 שיחה נכנסה /twilio/answer")
-    response = VoiceResponse()
+    if request.method == "OPTIONS":
+        print("🔧 Received OPTIONS request on /twilio/answer")
+        return Response(status=200)
 
+    print("📞 שיחה נכנסה /twilio/answer")
+
+    response = VoiceResponse()
     gather = Gather(
         input='speech',
         action='/twilio/process',

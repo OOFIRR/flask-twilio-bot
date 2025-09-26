@@ -1,249 +1,298 @@
-from flask import Flask, request, Response
-from dotenv import load_dotenv
-from twilio.twiml.voice_response import VoiceResponse, Gather
-import openai
 import os
-import json
-import uuid
-from urllib.parse import urljoin
-import traceback
-import threading
+import io
+import re
 import time
+import requests
+from flask import Flask, request, url_for
+from twilio.twiml.voice_response import VoiceResponse, Gather
+from openai import OpenAI
+from google.cloud import texttospeech
+from google.api_core.exceptions import GoogleAPICallError
+from google.auth.exceptions import DefaultCredentialsError
+from elevenlabs import generate, set_api_key, save
+from elevenlabs.api import Voices
 
-print("🚀 Flask app is loading...")
+# --- Configuration (Load Environment Variables) ---
+# Note: Railway provides a $PORT variable automatically.
+port = int(os.environ.get("PORT", 5000))
+# The static_url_path is explicitly set to '/static' for Twilio to find the WAVs
+app = Flask(__name__, static_folder='static', static_url_path='/static') 
 
-# --- Global Initialization and Error Handling ---
+# API Key Constants
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID")
+TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN")
 
-# Load environment variables (from .env file if running locally)
-load_dotenv(dotenv_path='env/.env')
+# ElevenLabs Variables
+ELEVENLABS_API_KEY = os.environ.get("ELEVENLABS_API_KEY")
+# Example ID for a multilingual Hebrew voice, replace with your preferred voice ID
+ELEVENLABS_VOICE_ID = os.environ.get("ELEVENLABS_VOICE_ID", "EXiS7oG68cK1F9bH5V8A") 
 
-app = Flask(__name__)
-
-# In-memory session context for conversation history
-session_memory = {}
-
-# API keys and credentials (loaded from Railway environment variables)
-openai.api_key = os.getenv("OPENAI_API_KEY")
-google_creds_json = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON")
-
-TTS_AVAILABLE = False
+# --- Initialize Services ---
+client = None
 try:
-    # Attempt to import Google TTS libraries
-    from google.cloud import texttospeech
-    from google.oauth2 import service_account
-    TTS_AVAILABLE = True
-    print("Google TTS libraries loaded successfully. ✅")
-except ImportError as e:
-    print(f"❌ Google TTS IMPORT FAILED: {e}. Falling back to Twilio TTS.")
+    if OPENAI_API_KEY:
+        client = OpenAI(api_key=OPENAI_API_KEY)
 except Exception as e:
-    # Catches issues with loading credentials or other config problems
-    print(f"❌ Google TTS IMPORT FAILED due to a configuration error: {e}. Falling back to Twilio TTS.")
+    print(f"Error initializing OpenAI client: {e}")
+
+# Check Google TTS Credentials
+try:
+    if os.environ.get("GOOGLE_APPLICATION_CREDENTIALS_JSON"):
+        print("Google TTS credentials found. ✅")
+    else:
+        print("Google TTS credentials missing.")
+except Exception:
+    print("Google TTS credentials check failed.")
 
 
-# Ensure the static directory exists for WAV files
+# Check ElevenLabs Credentials
+try:
+    if ELEVENLABS_API_KEY:
+        set_api_key(ELEVENLABS_API_KEY)
+        print("ElevenLabs API key loaded successfully. ✅")
+    else:
+        print("ElevenLabs API key missing. Using Google TTS/Twilio Say as fallback.")
+except Exception as e:
+    print(f"Error setting ElevenLabs API key: {e}")
+
+# Ensure the directory for static WAV files exists
 STATIC_DIR = os.path.join(os.getcwd(), 'static')
-try:
-    os.makedirs(STATIC_DIR, exist_ok=True)
+if not os.path.exists(STATIC_DIR):
+    os.makedirs(STATIC_DIR)
     print(f"📁 Ensured static directory exists at: {STATIC_DIR}")
-except Exception as e:
-    print(f"❌ Failed to ensure static directory exists: {e}")
-
 
 # --- Helper Functions ---
 
-def get_tts_client():
-    """Initializes and returns the Google Text-to-Speech client."""
-    if not TTS_AVAILABLE:
-        raise EnvironmentError("Google TTS is not available.")
-        
-    if not google_creds_json:
-        # This shouldn't happen if GOOGLE_APPLICATION_CREDENTIALS_JSON is set on Railway
-        raise EnvironmentError("Missing Google TTS credentials (JSON string).")
-        
-    try:
-        credentials_dict = json.loads(google_creds_json)
-        credentials = service_account.Credentials.from_service_account_info(credentials_dict)
-        return texttospeech.TextToSpeechClient(credentials=credentials)
-    except Exception as e:
-        print(f"❌ Google TTS init failed during client creation: {e}")
-        raise
-
-
-def delete_file_later(path, delay=30):
-    """Deletes a file asynchronously after a delay."""
-    def _delete():
-        time.sleep(delay)
-        try:
-            os.remove(path)
-            print(f"🗑️ Deleted file: {path}")
-        except Exception as e:
-            print(f"❌ Failed to delete file {path}:", e)
+# Function to generate TTS using ElevenLabs (Primary)
+def generate_tts_elevenlabs(text, filename):
+    """Generates audio using ElevenLabs and saves it to a WAV file."""
+    print(f"Attempting ElevenLabs TTS (Primary) for: {text[:30]}...")
     
-    # Start the deletion process in a new thread
-    threading.Thread(target=_delete).start()
-
-
-# --- Flask Routes ---
-
-@app.route("/", methods=["GET"])
-def index():
-    """Health Check Route."""
-    print("✅ GET / called")
-    return "✅ Flask server is running on Railway and ready for Twilio calls!"
-
-
-@app.route("/twilio/answer", methods=["POST"])
-def twilio_answer():
-    """Entry point for a new call from Twilio. Uses Twilio Say for stability."""
-    try:
-        print("📞 New call: /twilio/answer")
+    if not ELEVENLABS_API_KEY:
+        return False
         
-        response = VoiceResponse()
-
-        gather = Gather(
-            input='speech',
-            action='/twilio/process',
-            method='POST',
-            language='he-IL',
-            speech_timeout='auto'
+    try:
+        # Generate audio stream (audio is pcm data)
+        audio = generate(
+            text=text,
+            voice=ELEVENLABS_VOICE_ID,
+            model='eleven_multilingual_v2', # Supports Hebrew
+            stream=False 
         )
         
-        # *** CRITICAL FIX: Use Twilio's built-in TTS (<Say>) for the initial prompt ***
-        # This bypasses the static file access issue observed on Railway for the first prompt.
-        gather.say("שלום! איך אפשר לעזור לך היום?", language='he-IL')
+        # Save the audio stream to the file
+        filepath = os.path.join(STATIC_DIR, filename)
+        # Note: ElevenLabs outputs MP3/MPEG audio by default, which Twilio supports.
+        # However, to maintain the WAV file extension for consistency:
+        with open(filepath, "wb") as f:
+            f.write(audio)
         
-        response.append(gather)
+        print(f"ElevenLabs TTS successful. Saved to {filepath}")
+        return True
         
-        # If the user doesn't respond
-        response.say("לא קיבלתי תשובה. להתראות!", language='he-IL')
-
-        xml_str = str(response)
-        return Response(xml_str, status=200, mimetype='application/xml', headers={"Content-Type": "text/xml"})
-
     except Exception as e:
-        print("❌ ERROR in /twilio/answer:", e)
-        traceback.print_exc()
-        return Response("Internal Server Error", status=500)
+        print(f"ElevenLabs TTS failed. Error: {e}")
+        return False
 
-
-@app.route("/twilio/process", methods=["POST"])
-def twilio_process():
-    """Handles speech input, queries GPT, generates Google TTS audio, and continues the call."""
+# Function to generate TTS using Google Cloud TTS (Fallback 1)
+def generate_tts_google(text, filename):
+    """Generates audio using Google TTS and saves it to a WAV file."""
+    print(f"Attempting Google TTS (Fallback) for: {text[:30]}...")
     try:
-        print("🛠️ Request to /twilio/process")
+        tts_client = texttospeech.TextToSpeechClient()
+        synthesis_input = texttospeech.SynthesisInput(text=text)
         
-        user_input = request.form.get('SpeechResult')
-        call_sid = request.form.get('CallSid')
-
-        # --- Handle Missing Input ---
-        if not user_input:
-            print("⚠️ No speech input")
-            response = VoiceResponse()
-            response.say("לא שמעתי אותך. תוכל לנסות שוב?", language='he-IL')
-            gather = Gather(
-                input='speech',
-                action='/twilio/process',
-                method='POST',
-                language='he-IL',
-                speech_timeout='auto'
-            )
-            gather.say("מה תרצה לדעת?", language='he-IL')
-            response.append(gather)
-            return Response(str(response), status=200, mimetype='application/xml', headers={"Content-Type": "text/xml"})
-
-        print(f"📞 CallSid: {call_sid}")
-        print("🗣️ User said:", user_input)
-
-        # --- Session Management (Conversation Memory) ---
-        messages = session_memory.get(call_sid, [])
+        voice = texttospeech.VoiceSelectionParams(
+            language_code="he-IL",
+            name="he-IL-Wavenet-A" # A high-quality male voice
+        )
         
-        # System instruction for Hebrew
-        if not messages:
-             messages.append({"role": "system", "content": "אתה עוזר וירטואלי שמנהל שיחת טלפון ידידותית בעברית. השב בקצרה, בבהירות ובטון טבעי."})
+        audio_config = texttospeech.AudioConfig(
+            audio_encoding=texttospeech.AudioEncoding.LINEAR16, # Twilio prefers LINEAR16 or MP3
+            sample_rate_hertz=8000 # 8000 Hz is required for Twilio phone calls
+        )
 
-        messages.append({"role": "user", "content": user_input})
+        response = tts_client.synthesize_speech(
+            input=synthesis_input, voice=voice, audio_config=audio_config
+        )
+
+        # The response's audio_content is binary.
+        filepath = os.path.join(STATIC_DIR, filename)
+        with open(filepath, "wb") as out:
+            out.write(response.audio_content)
+        print(f"Google TTS successful. Saved to {filepath}")
+        return True
+    
+    except (DefaultCredentialsError, GoogleAPICallError) as e:
+        print(f"Google TTS failed due to credentials or API call issue: {e}")
+        return False
+    except Exception as e:
+        print(f"Google TTS failed unexpectedly: {e}")
+        return False
+
+# Master TTS function: Tries ElevenLabs, then Google TTS
+def generate_tts_wav(text):
+    """Generates a unique WAV/MP3 file and returns its URL, using ElevenLabs or Google TTS."""
+    # Use a generic filename extension, Twilio can usually handle MP3/MPEG from ElevenLabs
+    filename = f"output_{int(time.time())}_{os.getpid()}.wav" 
+    
+    # 1. Try ElevenLabs
+    if ELEVENLABS_API_KEY and generate_tts_elevenlabs(text, filename):
+        return url_for('static', filename=filename, _external=True)
+
+    # 2. Try Google TTS (Fallback)
+    if generate_tts_google(text, filename):
+        return url_for('static', filename=filename, _external=True)
         
-        # --- OpenAI Call ---
-        gpt_response = openai.ChatCompletion.create(
+    # 3. Final failure
+    print("All high-quality TTS options failed.")
+    return None
+
+# --- Application Logic (GPT and Memory) ---
+
+# Simple in-memory history (CAUTION: Resets on server restart and not scalable)
+conversation_history = {} 
+
+def call_openai_with_memory(new_user_input, call_sid, client):
+    """Handles the OpenAI API call, managing history."""
+    
+    global conversation_history
+    history = conversation_history.get(call_sid, "")
+    
+    # 1. Define the system prompt
+    system_prompt = (
+        "את/ה בוט קולי בעברית, ידידותי, מתמצת ומהיר תגובה. "
+        "אורך התשובה שלך **חייב להיות קצר מאוד** (משפט אחד או שניים מקסימום). "
+        "ענה תמיד בעברית ודאג שהתשובה תהיה מנוקדת ומוכנה לקריאה קולית. "
+        "זכור את ההיסטוריה ואל תחזור על עצמך. "
+        "היסטוריה קודמת: " + history
+    )
+    
+    try:
+        response = client.chat.completions.create(
             model="gpt-3.5-turbo",
-            messages=messages,
-            max_tokens=150,
-            temperature=0.7
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": new_user_input}
+            ],
+            temperature=0.7,
+            max_tokens=150
         )
-        bot_text = gpt_response.choices[0].message.content.strip()
-        print("🤖 GPT says:", bot_text)
-
-        # Update conversation memory
-        messages.append({"role": "assistant", "content": bot_text})
-        session_memory[call_sid] = messages
         
-        # --- Create TwiML Response ---
-        response = VoiceResponse()
-
-        if TTS_AVAILABLE:
-             # --- Generate Audio (Google TTS) ---
-            try:
-                tts_client = get_tts_client()
-                synthesis_input = texttospeech.SynthesisInput(text=bot_text)
-                voice = texttospeech.VoiceSelectionParams(
-                    language_code="he-IL",
-                    ssml_gender=texttospeech.SsmlVoiceGender.NEUTRAL
-                )
-                # Important: Twilio requires 8000Hz PCM 16-bit
-                audio_config = texttospeech.AudioConfig(
-                    audio_encoding=texttospeech.AudioEncoding.LINEAR16,
-                    sample_rate_hertz=8000 
-                )
-                response_tts = tts_client.synthesize_speech(
-                    input=synthesis_input,
-                    voice=voice,
-                    audio_config=audio_config
-                )
-
-                # --- Save File and Schedule Deletion ---
-                unique_id = str(uuid.uuid4())
-                output_path = os.path.join(STATIC_DIR, f"output_{unique_id}.wav") 
-                with open(output_path, "wb") as out:
-                    out.write(response_tts.audio_content)
-                    
-                delete_file_later(output_path, delay=30) 
-
-                # Create public URL (Twilio will fetch this)
-                wav_url = urljoin(request.host_url, f"static/output_{unique_id}.wav")
-                print(f"🔊 Playing audio using Google TTS: {wav_url}")
-
-                response.play(wav_url) 
-            except Exception as e:
-                print(f"❌ Google TTS runtime failed ({e}). Falling back to Twilio Say.")
-                # Fallback to Twilio Say if Google TTS fails during runtime
-                response.say(bot_text, language='he-IL')
-        else:
-             # Fallback to Twilio Say if Google TTS was never available
-             print("🔊 Playing audio using Twilio Say (Google TTS not available).")
-             response.say(bot_text, language='he-IL')
-
-        # Continue the conversation loop
-        gather = Gather(
-            input='speech',
-            action='/twilio/process',
-            method='POST',
-            language='he-IL',
-            speech_timeout='auto'
-        )
-        gather.say("יש לך שאלה נוספת?", language='he-IL')
-        response.append(gather)
-
-        return Response(str(response), status=200, mimetype='application/xml', headers={"Content-Type": "text/xml"})
-
+        gpt_response = response.choices[0].message.content.strip()
+        
+        # 2. Update History
+        new_history = f"אדם: {new_user_input}\nבוט: {gpt_response}\n"
+        conversation_history[call_sid] = history + new_history
+        
+        return gpt_response
+        
     except Exception as e:
-        print("❌ ERROR in /twilio/process:", e)
-        traceback.print_exc()
-        # Friendly error response
-        response = VoiceResponse()
-        response.say("אירעה שגיאה. נסה שוב מאוחר יותר.", language='he-IL')
-        return Response(str(response), status=200, mimetype='application/xml', headers={"Content-Type": "text/xml"})
+        print(f"OpenAI API call failed: {e}")
+        return "אני מצטער/ת, הייתה שגיאה בחיבור לשירותי הבינה המלאכותית. אנא נסה/י שוב."
 
+# --- Twilio Routes ---
+
+@app.route("/")
+def home():
+    """Simple health check endpoint."""
+    return "Flask server is running on Railway and ready for Twilio calls! (ElevenLabs Ready)"
+
+@app.route("/twilio/answer", methods=['POST'])
+def twilio_answer():
+    """Initial route when a call comes in. Prompts the user."""
+    print("📞 New call: /twilio/answer")
+    
+    resp = VoiceResponse()
+    
+    # 1. Start Gathering Input (Speech Recognition)
+    gather = Gather(
+        input='speech',
+        action=url_for('twilio_process', _external=True),
+        language='he-IL', # Use he-IL for Hebrew Speech Recognition
+        speech_timeout='auto',
+        action_on_empty_result=False
+    )
+    
+    # 2. The initial prompt (using Twilio Say as the most reliable method for the first turn)
+    # We MUST use a supported language (en-US) for Twilio's Say to actually generate audio.
+    gather.say('שלום! איך אפשר לעזור לך היום?', language='en-US') 
+    
+    resp.append(gather)
+    
+    # 3. Fallback if no speech is detected after the initial prompt
+    resp.say("לא קיבלתי תשובה. להתראות!", language='en-US') 
+    
+    # Clean up old files 
+    cleanup_old_wavs()
+    
+    return str(resp)
+
+
+@app.route("/twilio/process", methods=['POST'])
+def twilio_process():
+    """Processes the user's speech input and generates a response."""
+    
+    user_speech = request.values.get('SpeechResult')
+    call_sid = request.values.get('CallSid')
+    
+    print(f"👂 User said: {user_speech}")
+    
+    resp = VoiceResponse()
+    
+    if not user_speech:
+        print("🤷‍♂️ No speech detected, hanging up.")
+        resp.say("לא זיהיתי את דבריך. להתראות!", language='en-US')
+        return str(resp)
+
+    # 1. Get GPT Response
+    gpt_text = call_openai_with_memory(user_speech, call_sid, client)
+    print(f"🤖 GPT Response: {gpt_text}")
+
+    # 2. Convert GPT Text to Speech (ElevenLabs > Google TTS > Twilio Say)
+    wav_url = generate_tts_wav(gpt_text)
+    
+    if wav_url:
+        # Use Twilio <Play> if a high-quality WAV file was successfully generated
+        print(f"🔊 Playing high-quality WAV from: {wav_url}")
+        resp.play(wav_url)
+    else:
+        # Fallback to Twilio Say if all high-quality TTS options failed
+        print("🔊 Playing Twilio Say (Fallback).")
+        resp.say(gpt_text, language='en-US') # MUST use en-US for Twilio Say
+
+    # 3. Continue the conversation (Gather)
+    gather = Gather(
+        input='speech',
+        action=url_for('twilio_process', _external=True),
+        language='he-IL', # Use he-IL to enable Hebrew speech recognition
+        speech_timeout='auto',
+        action_on_empty_result=False
+    )
+    
+    # Twilio plays the WAV/MP3 file first, and only then starts listening for the next turn.
+    resp.append(gather)
+    
+    return str(resp)
+
+# --- Cleanup ---
+
+def cleanup_old_wavs(max_age_seconds=3600):
+    """Deletes WAV files older than max_age_seconds."""
+    now = time.time()
+    for filename in os.listdir(STATIC_DIR):
+        if filename.endswith(('.wav', '.mp3')):
+            filepath = os.path.join(STATIC_DIR, filename)
+            if os.path.getmtime(filepath) < now - max_age_seconds:
+                os.remove(filepath)
+                # print(f"🧹 Deleted old WAV: {filename}")
+
+
+# --- Flask Run ---
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(debug=True, host="0.0.0.0", port=port)
+    print(f"🚀 Flask app is loading...")
+    # Clean up files on startup
+    cleanup_old_wavs(max_age_seconds=0) 
+    app.run(debug=True, host='0.0.0.0', port=port)

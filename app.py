@@ -39,7 +39,7 @@ def call_llm_api(prompt):
         return "אני מצטער, אבל מודל השפה כרגע אינו זמין."
 
     messages = [
-        {"role": "system", "content": "אתה בוט טלפוני בעברית, חברותי, ענייני וממוקד. ענה בקצרה, בטון קול טבעי, כאילו אתה מדבר בטלפון. השם שלך הוא בוט."}
+        {"role": "system", "content": "אתה בוט טלפוני בעברית, חברותי, ענייני וממוקד. ענה בקצרה, בטון קול טבעי, כאילו אתה מדבר בטלפון."}
     ]
     messages.append({"role": "user", "content": prompt})
 
@@ -65,13 +65,16 @@ def voice():
     """
     response = VoiceResponse()
     
-    initial_prompt = "שלום, הגעת לבוט הטלפוני. איך אוכל לעזור לך היום?"
+    # שינוי ההודעה לשפה אנגלית לבדיקה
+    initial_prompt = "Hello. Please speak after the beep. How can I help you today?"
     
     # שימוש ב-Say המובנה של Twilio
-    print("Using Twilio default Say (ElevenLabs disabled)")
-    response.say(initial_prompt, language=HEBREW_LANGUAGE_CODE)
+    print("Using Twilio default Say with English TTS to confirm sound is working.")
+    # השתמשו ב-en-US עבור TTS כדי לוודא שקול כלשהו נשמע
+    response.say(initial_prompt, language='en-US') 
 
     # בקשה לאיסוף הקלט הקולי של המשתמש (Gather)
+    # נשארים על עברית עבור זיהוי דיבור
     response.gather(
         input='speech',
         action='/handle_speech',
@@ -97,9 +100,9 @@ def handle_speech():
         llm_response_text = call_llm_api(spoken_text)
         print(f"LLM response: {llm_response_text}")
 
-        # שימוש ב-Say המובנה של Twilio
-        print("Using Twilio default Say (ElevenLabs disabled)")
-        response.say(llm_response_text, language=HEBREW_LANGUAGE_CODE)
+        # שימוש ב-Say המובנה של Twilio - מעבר לאנגלית לצורך הבדיקה
+        print("Using Twilio default Say with English TTS to confirm response.")
+        response.say(llm_response_text, language='en-US')
 
         # איסוף קלט נוסף כדי להמשיך את השיחה (לולאה)
         response.gather(
@@ -110,7 +113,8 @@ def handle_speech():
         )
         
     else:
-        response.say("לא שמעתי אותך. תוכל לחזור על דבריך?", language=HEBREW_LANGUAGE_CODE)
+        # גם כאן מעבר לאנגלית
+        response.say("Sorry, I did not hear you. Please repeat.", language='en-US')
         response.gather(
             input='speech',
             action='/handle_speech',

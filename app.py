@@ -1,4 +1,4 @@
-from flask import Flask, request, Response
+from flask import Flask, request, Response, make_response
 from dotenv import load_dotenv
 from google.cloud import texttospeech
 from google.oauth2 import service_account
@@ -13,7 +13,7 @@ import traceback
 
 print("🚀 Flask app is loading...")
 
-# Load .env file (for local dev only)
+# Load local .env file (ignored on Railway)
 load_dotenv(dotenv_path='env/.env')
 
 # === Debug: Check env variables === #
@@ -27,7 +27,7 @@ print("GOOGLE_APPLICATION_CREDENTIALS_JSON length:", len(google_creds) if google
 # Init Flask
 app = Flask(__name__)
 
-# Global error handler
+# === Global error handler === #
 @app.errorhandler(Exception)
 def handle_exception(e):
     print("❌ Unhandled Exception:", e)
@@ -37,11 +37,10 @@ def handle_exception(e):
 # Set OpenAI API Key
 openai.api_key = openai_key
 
-# === Helper: Create TTS client on demand === #
+# === Helper: Create Google TTS client === #
 def get_tts_client():
     if not google_creds:
         raise RuntimeError("Missing GOOGLE_APPLICATION_CREDENTIALS_JSON environment variable.")
-    
     try:
         credentials_dict = json.loads(google_creds)
         credentials = service_account.Credentials.from_service_account_info(credentials_dict)
@@ -50,18 +49,19 @@ def get_tts_client():
         print("❌ Google TTS init failed:", e)
         raise
 
-# === Routes === #
-
+# === Route: Health check === #
 @app.route("/", methods=["GET"])
 def index():
     try:
         print("✅ GET / called")
-        return "✅ Flask server is running on Railway!"
+        response = make_response("✅ Flask server is running on Railway!", 200)
+        response.mimetype = "text/plain"
+        return response
     except Exception as e:
         print("❌ Index Error:", e)
         return "Internal Error", 500
 
-
+# === Route: Twilio call entry === #
 @app.route("/twilio/answer", methods=["POST"])
 def twilio_answer():
     print("📞 שיחה נכנסה /twilio/answer")
@@ -75,13 +75,12 @@ def twilio_answer():
         speech_timeout='auto'
     )
     gather.say("שלום! איך אפשר לעזור לך היום?", language='he-IL')
-
     response.append(gather)
-    response.say("לא קיבלתי תשובה. להתראות!", language='he-IL')
 
+    response.say("לא קיבלתי תשובה. להתראות!", language='he-IL')
     return Response(str(response), mimetype='application/xml')
 
-
+# === Route: Process speech input === #
 @app.route("/twilio/process", methods=["POST"])
 def twilio_process():
     print("🛠️ בקשה ל־/twilio/process")
@@ -104,6 +103,7 @@ def twilio_process():
 
     print("🗣️ המשתמש אמר:", user_input)
 
+    # --- GPT response --- #
     try:
         gpt_response = openai.ChatCompletion.create(
             model="gpt-3.5-turbo",
@@ -119,6 +119,7 @@ def twilio_process():
         response.say("אירעה שגיאה עם המערכת. נסה שוב מאוחר יותר.", language='he-IL')
         return Response(str(response), mimetype='application/xml')
 
+    # --- Google TTS --- #
     try:
         tts_client = get_tts_client()
         synthesis_input = texttospeech.SynthesisInput(text=bot_text)
@@ -128,7 +129,7 @@ def twilio_process():
         )
         audio_config = texttospeech.AudioConfig(
             audio_encoding=texttospeech.AudioEncoding.LINEAR16,
-            sample_rate_hertz=8000
+            sample_rate_hertz=8000  # for telephony
         )
         response_tts = tts_client.synthesize_speech(
             input=synthesis_input,
@@ -144,9 +145,11 @@ def twilio_process():
         wav_url = urljoin(request.host_url, f"static/output_{unique_id}.wav")
         print(f"🔊 Playing audio: {wav_url}")
 
+        # Build response
         response = VoiceResponse()
         response.play(wav_url)
 
+        # Follow-up
         gather = Gather(
             input='speech',
             action='/twilio/process',

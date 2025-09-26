@@ -11,23 +11,30 @@ from urllib.parse import urljoin
 
 print("🚀 Flask app is loading...")
 
-# Load local .env if running locally (ignored on Railway)
+# Load .env file (for local dev only)
 load_dotenv(dotenv_path='env/.env')
+
+# === Debug: Check env variables === #
+print("🔑 Checking env variables...")
+openai_key = os.getenv("OPENAI_API_KEY")
+google_creds = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON")
+
+print("OPENAI_API_KEY loaded:", "✅" if openai_key else "❌ MISSING")
+print("GOOGLE_APPLICATION_CREDENTIALS_JSON length:", len(google_creds) if google_creds else "❌ MISSING")
 
 # Init Flask
 app = Flask(__name__)
 
-# OpenAI API Key
-openai.api_key = os.getenv("OPENAI_API_KEY")
+# Set OpenAI API Key
+openai.api_key = openai_key
 
 # === Helper: Create TTS client on demand === #
 def get_tts_client():
-    google_creds_json = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON")
-    if not google_creds_json:
+    if not google_creds:
         raise RuntimeError("Missing GOOGLE_APPLICATION_CREDENTIALS_JSON environment variable.")
     
     try:
-        credentials_dict = json.loads(google_creds_json)
+        credentials_dict = json.loads(google_creds)
         credentials = service_account.Credentials.from_service_account_info(credentials_dict)
         return texttospeech.TextToSpeechClient(credentials=credentials)
     except Exception as e:
@@ -148,9 +155,3 @@ def twilio_process():
         response = VoiceResponse()
         response.say("אירעה שגיאה ביצירת השמע.", language='he-IL')
         return Response(str(response), mimetype='application/xml')
-
-
-# === Run App === #
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(debug=True, host="0.0.0.0", port=port)

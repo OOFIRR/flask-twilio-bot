@@ -1,7 +1,0 @@
-Vonage
-API Account Secret
-AoyIta1aFbdLzhWt
-API key: d3b17303
-
-open ai key 
-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

@@ -1,0 +1,6 @@
+env/
+*.json
+*.txt
+output.mp3
+__pycache__/
+*.pyc

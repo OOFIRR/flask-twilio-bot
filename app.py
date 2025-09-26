@@ -5,9 +5,9 @@ from flask import Flask, request
 from twilio.twiml.voice_response import VoiceResponse, Gather
 
 # --- תיקון ייבוא ElevenLabs לשימוש ב-Client Object ---
-# אנו מייבאים את המחלקה ElevenLabs כדי להשתמש בשיטת Generate יציבה יותר
+# אנו מייבאים רק את המחלקה ElevenLabs
 from elevenlabs.client import ElevenLabs 
-from elevenlabs import set_api_key, Voice 
+# set_api_key ו-Voice אינם נחוצים לייבוא ישיר יותר, מה שמונע קריסות
 
 from openai import OpenAI
 
@@ -41,8 +41,7 @@ elevenlabs_initialized = False
 
 try:
     if ELEVENLABS_API_KEY:
-        # אתחול לקוח ElevenLabs (השתמשנו ב-set_api_key כדי לוודא שכל המודולים מקבלים את המפתח)
-        set_api_key(ELEVENLABS_API_KEY)
+        # אתחול לקוח ElevenLabs. הסרת set_api_key, מאחר שהמפתח עובר ישירות ל-Client.
         elevenlabs_client = ElevenLabs(api_key=ELEVENLABS_API_KEY)
         elevenlabs_initialized = True
         print("ElevenLabs client initialized successfully.")

@@ -10,6 +10,7 @@ import uuid
 from urllib.parse import urljoin
 import sys
 import traceback
+print("📥 Request to /twilio/answer, method:", request.method)
 
 print("🚀 Flask app is loading...")
 

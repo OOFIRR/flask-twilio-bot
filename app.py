@@ -8,8 +8,8 @@ import os
 import json
 import uuid
 from urllib.parse import urljoin
-print("🚀 Flask app is loading...")
 
+print("🚀 Flask app is loading...")
 
 # Load local .env if running locally (ignored on Railway)
 load_dotenv(dotenv_path='env/.env')
@@ -34,8 +34,13 @@ def get_tts_client():
         print("❌ Google TTS init failed:", e)
         raise
 
-
 # === Routes === #
+
+@app.route("/", methods=["GET"])
+def index():
+    print("✅ GET / called")
+    return "✅ Flask server is running on Railway!"
+
 
 @app.route("/twilio/answer", methods=["POST"])
 def twilio_answer():
@@ -81,61 +86,68 @@ def twilio_process():
 
     print("🗣️ המשתמש אמר:", user_input)
 
-    gpt_response = openai.ChatCompletion.create(
-        model="gpt-3.5-turbo",
-        messages=[{"role": "user", "content": user_input}],
-        max_tokens=100,
-        temperature=0.7
-    )
-    bot_text = gpt_response.choices[0].message.content
-    print("🤖 תשובת GPT:", bot_text)
+    try:
+        gpt_response = openai.ChatCompletion.create(
+            model="gpt-3.5-turbo",
+            messages=[{"role": "user", "content": user_input}],
+            max_tokens=100,
+            temperature=0.7
+        )
+        bot_text = gpt_response.choices[0].message.content
+        print("🤖 תשובת GPT:", bot_text)
+    except Exception as e:
+        print("❌ GPT ERROR:", e)
+        response = VoiceResponse()
+        response.say("אירעה שגיאה עם המערכת. נסה שוב מאוחר יותר.", language='he-IL')
+        return Response(str(response), mimetype='application/xml')
 
-    # Synthesize speech with Google TTS (WAV)
-    tts_client = get_tts_client()
-    synthesis_input = texttospeech.SynthesisInput(text=bot_text)
-    voice = texttospeech.VoiceSelectionParams(
-        language_code="he-IL",
-        ssml_gender=texttospeech.SsmlVoiceGender.NEUTRAL
-    )
-    audio_config = texttospeech.AudioConfig(
-        audio_encoding=texttospeech.AudioEncoding.LINEAR16,
-        sample_rate_hertz=8000  # good for telephony
-    )
+    try:
+        tts_client = get_tts_client()
+        synthesis_input = texttospeech.SynthesisInput(text=bot_text)
+        voice = texttospeech.VoiceSelectionParams(
+            language_code="he-IL",
+            ssml_gender=texttospeech.SsmlVoiceGender.NEUTRAL
+        )
+        audio_config = texttospeech.AudioConfig(
+            audio_encoding=texttospeech.AudioEncoding.LINEAR16,
+            sample_rate_hertz=8000  # good for telephony
+        )
+        response_tts = tts_client.synthesize_speech(
+            input=synthesis_input,
+            voice=voice,
+            audio_config=audio_config
+        )
 
-    response_tts = tts_client.synthesize_speech(
-        input=synthesis_input,
-        voice=voice,
-        audio_config=audio_config
-    )
+        unique_id = str(uuid.uuid4())
+        output_path = f"static/output_{unique_id}.wav"
+        with open(output_path, "wb") as out:
+            out.write(response_tts.audio_content)
 
-    # Save WAV file with unique name
-    unique_id = str(uuid.uuid4())
-    output_path = f"static/output_{unique_id}.wav"
-    with open(output_path, "wb") as out:
-        out.write(response_tts.audio_content)
+        wav_url = urljoin(request.host_url, f"static/output_{unique_id}.wav")
+        print(f"🔊 Playing audio: {wav_url}")
 
-    # TwiML response
-    response = VoiceResponse()
-    wav_url = urljoin(request.host_url, f"static/output_{unique_id}.wav")
-    response.play(wav_url)
+        # Build response
+        response = VoiceResponse()
+        response.play(wav_url)
 
-    # Follow-up question
-    gather = Gather(
-        input='speech',
-        action='/twilio/process',
-        method='POST',
-        language='he-IL',
-        speech_timeout='auto'
-    )
-    gather.say("יש לך שאלה נוספת?", language='he-IL')
-    response.append(gather)
+        # Follow-up question
+        gather = Gather(
+            input='speech',
+            action='/twilio/process',
+            method='POST',
+            language='he-IL',
+            speech_timeout='auto'
+        )
+        gather.say("יש לך שאלה נוספת?", language='he-IL')
+        response.append(gather)
 
-    return Response(str(response), mimetype='application/xml')
+        return Response(str(response), mimetype='application/xml')
 
-
-@app.route("/", methods=["GET"])
-def index():
-    return "✅ Flask server is running on Railway!"
+    except Exception as e:
+        print("❌ Google TTS ERROR:", e)
+        response = VoiceResponse()
+        response.say("אירעה שגיאה ביצירת השמע.", language='he-IL')
+        return Response(str(response), mimetype='application/xml')
 
 
 # === Run App === #

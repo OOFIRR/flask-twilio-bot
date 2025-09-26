@@ -12,23 +12,23 @@ import time
 
 print("🚀 Flask app is loading...")
 
-# --- אתחול גלובלי והגנה מפני קריסה ---
+# --- Global Initialization and Error Handling ---
 
-# טעינת משתני סביבה
+# Load environment variables (from .env file if running locally)
 load_dotenv(dotenv_path='env/.env')
 
 app = Flask(__name__)
 
-# זיכרון שיחה זמני (In-memory session context). 
+# In-memory session context for conversation history
 session_memory = {}
 
-# משתני API (נטענים ברמת המודול)
+# API keys and credentials (loaded from Railway environment variables)
 openai.api_key = os.getenv("OPENAI_API_KEY")
 google_creds_json = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON")
 
 TTS_AVAILABLE = False
 try:
-    # ניסיון ייבוא קריטי שעלול לקרוס באתחול
+    # Attempt to import Google TTS libraries
     from google.cloud import texttospeech
     from google.oauth2 import service_account
     TTS_AVAILABLE = True
@@ -36,10 +36,11 @@ try:
 except ImportError as e:
     print(f"❌ Google TTS IMPORT FAILED: {e}. Falling back to Twilio TTS.")
 except Exception as e:
+    # Catches issues with loading credentials or other config problems
     print(f"❌ Google TTS IMPORT FAILED due to a configuration error: {e}. Falling back to Twilio TTS.")
 
 
-# הגנה מפני קריסה: ודא שספריית ה-static קיימת
+# Ensure the static directory exists for WAV files
 STATIC_DIR = os.path.join(os.getcwd(), 'static')
 try:
     os.makedirs(STATIC_DIR, exist_ok=True)
@@ -48,14 +49,15 @@ except Exception as e:
     print(f"❌ Failed to ensure static directory exists: {e}")
 
 
-# --- פונקציות עזר (Helper Functions) ---
+# --- Helper Functions ---
 
 def get_tts_client():
-    """מאתחל ומחזיר את לקוח Google Text-to-Speech."""
+    """Initializes and returns the Google Text-to-Speech client."""
     if not TTS_AVAILABLE:
         raise EnvironmentError("Google TTS is not available.")
         
     if not google_creds_json:
+        # This shouldn't happen if GOOGLE_APPLICATION_CREDENTIALS_JSON is set on Railway
         raise EnvironmentError("Missing Google TTS credentials (JSON string).")
         
     try:
@@ -68,7 +70,7 @@ def get_tts_client():
 
 
 def delete_file_later(path, delay=30):
-    """מוחק קובץ באופן אסינכרוני לאחר השהייה."""
+    """Deletes a file asynchronously after a delay."""
     def _delete():
         time.sleep(delay)
         try:
@@ -77,21 +79,22 @@ def delete_file_later(path, delay=30):
         except Exception as e:
             print(f"❌ Failed to delete file {path}:", e)
     
+    # Start the deletion process in a new thread
     threading.Thread(target=_delete).start()
 
 
-# --- ראוטים של Flask ---
+# --- Flask Routes ---
 
 @app.route("/", methods=["GET"])
 def index():
-    """ראוט בדיקת חיים (Health Check)."""
+    """Health Check Route."""
     print("✅ GET / called")
     return "✅ Flask server is running on Railway and ready for Twilio calls!"
 
 
 @app.route("/twilio/answer", methods=["POST"])
 def twilio_answer():
-    """נקודת הכניסה לשיחה חדשה מ-Twilio."""
+    """Entry point for a new call from Twilio. Uses Twilio Say for stability."""
     try:
         print("📞 New call: /twilio/answer")
         
@@ -104,9 +107,14 @@ def twilio_answer():
             language='he-IL',
             speech_timeout='auto'
         )
+        
+        # *** CRITICAL FIX: Use Twilio's built-in TTS (<Say>) for the initial prompt ***
+        # This bypasses the static file access issue observed on Railway for the first prompt.
         gather.say("שלום! איך אפשר לעזור לך היום?", language='he-IL')
+        
         response.append(gather)
         
+        # If the user doesn't respond
         response.say("לא קיבלתי תשובה. להתראות!", language='he-IL')
 
         xml_str = str(response)
@@ -120,14 +128,14 @@ def twilio_answer():
 
 @app.route("/twilio/process", methods=["POST"])
 def twilio_process():
-    """מטפל בקלט הקולי, שולח ל-GPT, יוצר אודיו וממשיך את השיחה."""
+    """Handles speech input, queries GPT, generates Google TTS audio, and continues the call."""
     try:
         print("🛠️ Request to /twilio/process")
         
         user_input = request.form.get('SpeechResult')
         call_sid = request.form.get('CallSid')
 
-        # --- טיפול בקלט חסר ---
+        # --- Handle Missing Input ---
         if not user_input:
             print("⚠️ No speech input")
             response = VoiceResponse()
@@ -146,7 +154,7 @@ def twilio_process():
         print(f"📞 CallSid: {call_sid}")
         print("🗣️ User said:", user_input)
 
-        # --- ניהול זיכרון שיחה (Session Management) ---
+        # --- Session Management (Conversation Memory) ---
         messages = session_memory.get(call_sid, [])
         
         # System instruction for Hebrew
@@ -155,7 +163,7 @@ def twilio_process():
 
         messages.append({"role": "user", "content": user_input})
         
-        # --- קריאה ל-OpenAI ---
+        # --- OpenAI Call ---
         gpt_response = openai.ChatCompletion.create(
             model="gpt-3.5-turbo",
             messages=messages,
@@ -165,15 +173,15 @@ def twilio_process():
         bot_text = gpt_response.choices[0].message.content.strip()
         print("🤖 GPT says:", bot_text)
 
-        # עדכון זיכרון השיחה
+        # Update conversation memory
         messages.append({"role": "assistant", "content": bot_text})
         session_memory[call_sid] = messages
         
-        # --- יצירת תגובת TwiML ---
+        # --- Create TwiML Response ---
         response = VoiceResponse()
 
         if TTS_AVAILABLE:
-             # --- יצירת אודיו (Google TTS) ---
+             # --- Generate Audio (Google TTS) ---
             try:
                 tts_client = get_tts_client()
                 synthesis_input = texttospeech.SynthesisInput(text=bot_text)
@@ -181,7 +189,7 @@ def twilio_process():
                     language_code="he-IL",
                     ssml_gender=texttospeech.SsmlVoiceGender.NEUTRAL
                 )
-                # חשוב: Twilio דורש 8000Hz PCM 16-bit
+                # Important: Twilio requires 8000Hz PCM 16-bit
                 audio_config = texttospeech.AudioConfig(
                     audio_encoding=texttospeech.AudioEncoding.LINEAR16,
                     sample_rate_hertz=8000 
@@ -192,7 +200,7 @@ def twilio_process():
                     audio_config=audio_config
                 )
 
-                # --- שמירת קובץ ומחיקה ---
+                # --- Save File and Schedule Deletion ---
                 unique_id = str(uuid.uuid4())
                 output_path = os.path.join(STATIC_DIR, f"output_{unique_id}.wav") 
                 with open(output_path, "wb") as out:
@@ -200,20 +208,21 @@ def twilio_process():
                     
                 delete_file_later(output_path, delay=30) 
 
-                # יצירת URL ציבורי
+                # Create public URL (Twilio will fetch this)
                 wav_url = urljoin(request.host_url, f"static/output_{unique_id}.wav")
                 print(f"🔊 Playing audio using Google TTS: {wav_url}")
 
                 response.play(wav_url) 
             except Exception as e:
                 print(f"❌ Google TTS runtime failed ({e}). Falling back to Twilio Say.")
+                # Fallback to Twilio Say if Google TTS fails during runtime
                 response.say(bot_text, language='he-IL')
         else:
-             # Fallback ל-Twilio Say
+             # Fallback to Twilio Say if Google TTS was never available
              print("🔊 Playing audio using Twilio Say (Google TTS not available).")
              response.say(bot_text, language='he-IL')
 
-        # ממשיך את לולאת השיחה
+        # Continue the conversation loop
         gather = Gather(
             input='speech',
             action='/twilio/process',
@@ -229,7 +238,7 @@ def twilio_process():
     except Exception as e:
         print("❌ ERROR in /twilio/process:", e)
         traceback.print_exc()
-        # תשובת שגיאה ידידותית למשתמש
+        # Friendly error response
         response = VoiceResponse()
         response.say("אירעה שגיאה. נסה שוב מאוחר יותר.", language='he-IL')
         return Response(str(response), status=200, mimetype='application/xml', headers={"Content-Type": "text/xml"})

@@ -8,6 +8,8 @@ import os
 import json
 import uuid
 from urllib.parse import urljoin
+import sys
+import traceback
 
 print("🚀 Flask app is loading...")
 
@@ -24,6 +26,13 @@ print("GOOGLE_APPLICATION_CREDENTIALS_JSON length:", len(google_creds) if google
 
 # Init Flask
 app = Flask(__name__)
+
+# Global error handler
+@app.errorhandler(Exception)
+def handle_exception(e):
+    print("❌ Unhandled Exception:", e)
+    traceback.print_exc(file=sys.stdout)
+    return "Internal Server Error", 500
 
 # Set OpenAI API Key
 openai.api_key = openai_key
@@ -45,13 +54,16 @@ def get_tts_client():
 
 @app.route("/", methods=["GET"])
 def index():
-    print("✅ GET / called")
-    return "✅ Flask server is running on Railway!"
+    try:
+        print("✅ GET / called")
+        return "✅ Flask server is running on Railway!"
+    except Exception as e:
+        print("❌ Index Error:", e)
+        return "Internal Error", 500
 
 
 @app.route("/twilio/answer", methods=["POST"])
 def twilio_answer():
-    """Initial webhook when call connects"""
     print("📞 שיחה נכנסה /twilio/answer")
     response = VoiceResponse()
 
@@ -72,7 +84,6 @@ def twilio_answer():
 
 @app.route("/twilio/process", methods=["POST"])
 def twilio_process():
-    """Process speech input and respond with audio"""
     print("🛠️ בקשה ל־/twilio/process")
 
     user_input = request.form.get('SpeechResult')
@@ -117,7 +128,7 @@ def twilio_process():
         )
         audio_config = texttospeech.AudioConfig(
             audio_encoding=texttospeech.AudioEncoding.LINEAR16,
-            sample_rate_hertz=8000  # good for telephony
+            sample_rate_hertz=8000
         )
         response_tts = tts_client.synthesize_speech(
             input=synthesis_input,
@@ -133,11 +144,9 @@ def twilio_process():
         wav_url = urljoin(request.host_url, f"static/output_{unique_id}.wav")
         print(f"🔊 Playing audio: {wav_url}")
 
-        # Build response
         response = VoiceResponse()
         response.play(wav_url)
 
-        # Follow-up question
         gather = Gather(
             input='speech',
             action='/twilio/process',

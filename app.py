@@ -1,221 +1,133 @@
-# -*- coding: utf-8 -*-
 import os
-import time
 import requests
 import json
-import uuid
-import tempfile
-from flask import Flask, request, jsonify
+from flask import Flask, request
 from twilio.twiml.voice_response import VoiceResponse, Gather
 
-# ייבוא תקני לפי גרסה עדכנית של elevenlabs
-from elevenlabs.client import ElevenLabs
-from elevenlabs import save
-from elevenlabs.api.error import APIError
+# --- הגדרות כלליות ---
+app = Flask(__name__)
 
-# --- 1. הגדרות וטעינת מפתחות API ---
+# הגדרת משתני סביבה.
+# OPENAI_API_KEY משמש עבור קריאות ל-Gemini API (דרך requests).
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY") 
+HEBREW_LANGUAGE_CODE = "he-IL" 
 
-ELEVENLABS_API_KEY = os.environ.get("ELEVENLABS_API_KEY")
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-HEBREW_VOICE_ID = os.environ.get("ELEVENLABS_VOICE_ID", "MTfTLiL7VOpWnuOQqiyV")
+# נשתמש בקול מפורש של Amazon Polly (Polly.Amy) שתומך בשפות רבות 
+# בניסיון לעקוף את בעיית ה-TTS העברי המובנה של Twilio
+HEBREW_VOICE = "Polly.Amy" 
 
-ELEVENLABS_CLIENT = None
-
-if ELEVENLABS_API_KEY:
-    try:
-        ELEVENLABS_CLIENT = ElevenLabs(api_key=ELEVENLABS_API_KEY)
-        print("ElevenLabs API key and client successfully loaded.")
-    except Exception as e:
-        print(f"Error setting ElevenLabs API key. TTS will use Twilio Say fallback. Error: {e}")
-
-CALL_CONTEXT = {}
-
-# --- 2. הגדרות שרת Flask ---
-app = Flask(__name__, static_url_path='/static', static_folder='static')
-
-# --- 3. פונקציות עזר ---
-
-def call_llm_api(prompt, call_sid):
+# --- פונקציית LLM ---
+def call_llm_api(prompt):
+    """
+    מתקשרת ל-Gemini API לקבלת תשובה.
+    """
     if not OPENAI_API_KEY:
-        print("OPENAI_API_KEY is not set. Cannot call LLM.")
-        return "אני מצטער, מודל השפה אינו זמין כרגע."
+        return "אני מצטער, אבל מודל השפה כרגע אינו זמין."
 
-    history = CALL_CONTEXT.get(call_sid, [])
+    # הגדרת ההנחיה המערכתית (System Instruction)
+    system_instruction = "אתה בוט טלפוני בעברית, חברותי, ענייני וממוקד. ענה בקצרה, בטון קול טבעי, כאילו אתה מדבר בטלפון."
     
-    history.append({
-        "role": "user",
-        "parts": [{"text": prompt}]
-    })
-
-    system_instruction = {
-        "parts": [{"text": "אתה עוזר קולי בעברית שמספק תשובות קצרות ותכליתיות. ענה בצורה ידידותית, קצרה וטבעית. אם המשתמש שואל שאלות מורכבות מדי, בקש ממנו לשאול שאלות פשוטות יותר."}]
-    }
-
-    api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent?key={OPENAI_API_KEY}"
-    
-    payload = {
-        "contents": history,
-        "systemInstruction": system_instruction,
-    }
+    # בניית ההודעות
+    messages = [
+        {"role": "user", "content": prompt}
+    ]
 
     try:
-        max_retries = 3
-        for attempt in range(max_retries):
-            response = requests.post(api_url, headers={'Content-Type': 'application/json'}, json=payload)
-            
-            if response.status_code == 429 and attempt < max_retries - 1:
-                wait_time = 2 ** attempt
-                time.sleep(wait_time)
-                continue
+        # בניית ה-URL וה-Payload לקריאה ישירה ל-Gemini API
+        api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent?key={OPENAI_API_KEY}"
+        
+        # מבנה ה-contents כולל את היסטוריית השיחה (רק ההודעה הנוכחית במקרה זה)
+        contents = [{"parts": [{"text": msg['content']}]} for msg in messages]
+        
+        payload = {
+            "contents": contents,
+            "systemInstruction": {"parts": [{"text": system_instruction}]},
+            "config": {"maxOutputTokens": 150, "temperature": 0.7}
+        }
 
-            response.raise_for_status()
-            break
-        else:
-            response.raise_for_status()
+        # ביצוע הקריאה ל-API
+        response = requests.post(
+            api_url, 
+            headers={'Content-Type': 'application/json'}, 
+            json=payload
+        )
+        response.raise_for_status() # זורק שגיאה אם הסטטוס אינו 2xx
 
         result = response.json()
-        candidate = result.get('candidates', [{}])[0]
-        text_response = candidate.get('content', {}).get('parts', [{}])[0].get('text', "מודל השפה לא הצליח להגיב.")
+        # חילוץ התשובה
+        text_response = result.get('candidates', [{}])[0].get('content', {}).get('parts', [{}])[0].get('text', "מודל השפה לא הצליח להגיב.")
+        return text_response.strip()
 
-        history.append({
-            "role": "model",
-            "parts": [{"text": text_response}]
-        })
-        CALL_CONTEXT[call_sid] = history
-        return text_response
-
-    except requests.exceptions.RequestException as e:
-        print(f"Error calling LLM API (Status: {response.status_code if 'response' in locals() else 'Unknown'}): {e}")
-        return "אני מצטער, חלה שגיאה בחיבור למודל השפה. אנא נסה שוב."
-
-
-def generate_tts_wav(text_to_speak, call_sid):
-    if not ELEVENLABS_CLIENT:
-        print("ElevenLabs client not initialized. Falling back to Twilio Say.")
-        return None
-        
-    try:
-        filename = f"{call_sid}_{int(time.time())}.wav"
-        filepath = os.path.join(app.static_folder, filename)
-        
-        audio = ELEVENLABS_CLIENT.generate(
-            text=text_to_speak,
-            voice=HEBREW_VOICE_ID,
-            model="eleven_multilingual_v2" 
-        )
-        
-        save(audio, filepath)
-        static_url = f"/static/{filename}"
-        return static_url
-
-    except APIError as e:
-        print(f"ElevenLabs API Error: {e}. Falling back to Twilio Say.")
-        return None
     except Exception as e:
-        print(f"General TTS Error: {e}. Falling back to Twilio Say. Error: {e}")
-        return None
+        print(f"LLM API Call Failed: {e}")
+        return "אני מצטער, חלה תקלה בשירות השפה. אנא נסה שוב."
+
+
+# --- Webhook לטיפול בשיחה נכנסת (התחלה) ---
+@app.route("/voice", methods=['GET', 'POST'])
+def voice():
+    """
+    נקודת הכניסה לשיחת הטלפון. מחזירה TwiML עם בקשה לקלט קולי.
+    """
+    response = VoiceResponse()
     
+    initial_prompt = "שלום, הגעת לבוט הטלפוני. איך אוכל לעזור לך היום?"
     
-def cleanup_wav_file(filepath):
-    try:
-        if filepath and os.path.exists(filepath):
-            os.remove(filepath)
-            print(f"Cleaned up file: {filepath}")
-    except OSError as e:
-        print(f"Error cleaning up file {filepath}: {e}")
+    print("Using Twilio default Say with explicit Hebrew Voice (Polly.Amy).")
+    # הפעלת TTS עם הקול המפורש
+    response.say(initial_prompt, language=HEBREW_LANGUAGE_CODE, voice=HEBREW_VOICE) 
 
-# --- 4. נתיבי Webhook ---
-
-@app.route("/twilio/answer", methods=['POST'])
-def answer_call():
-    resp = VoiceResponse()
-    call_sid = request.values.get('CallSid')
-    
-    welcome_text = "שלום! איך אפשר לעזור לך היום?"
-    wav_url = generate_tts_wav(welcome_text, call_sid)
-
-    if wav_url:
-        resp.play(url=request.url_root + wav_url)
-    else:
-        resp.say(welcome_text, voice='Polly.Amy', language='he-IL')
-
-    gather = Gather(
+    # בקשה לאיסוף הקלט הקולי של המשתמש (Gather)
+    response.gather(
         input='speech',
-        action='/twilio/handle_speech',
-        method='POST',
-        timeout=3,
-        speechTimeout='auto',
-        language='he-IL'
+        action='/handle_speech',
+        language=HEBREW_LANGUAGE_CODE,
+        speech_timeout='auto'
     )
     
-    resp.append(gather)
-    
-    return str(resp)
+    return str(response)
 
-@app.route("/twilio/handle_speech", methods=['POST'])
+# --- Webhook לטיפול בקלט קולי ---
+@app.route("/handle_speech", methods=['POST'])
 def handle_speech():
-    resp = VoiceResponse()
-    call_sid = request.values.get('CallSid')
-    user_speech = request.values.get('SpeechResult')
+    """
+    מקבל את הדיבור של המשתמש, שולח ל-LLM ומחזיר את התשובה.
+    """
+    response = VoiceResponse()
+    spoken_text = request.form.get('SpeechResult')
     
-    if user_speech is None or user_speech.strip() == "":
-        if call_sid in CALL_CONTEXT:
-            del CALL_CONTEXT[call_sid]
+    if spoken_text:
+        print(f"User said: {spoken_text}")
         
-        repeat_text = "לא שמעתי אותך בבירור. נסה שוב."
-        wav_url = generate_tts_wav(repeat_text, call_sid)
-        
-        if wav_url:
-            resp.play(url=request.url_root + wav_url)
-        else:
-            resp.say(repeat_text, voice='Polly.Amy', language='he-IL')
+        # קריאה ל-LLM
+        llm_response_text = call_llm_api(spoken_text)
+        print(f"LLM response: {llm_response_text}")
 
-        gather = Gather(
+        # שימוש ב-Say המובנה של Twilio
+        print("Using Twilio default Say with explicit Hebrew Voice (Polly.Amy).")
+        response.say(llm_response_text, language=HEBREW_LANGUAGE_CODE, voice=HEBREW_VOICE)
+
+        # איסוף קלט נוסף כדי להמשיך את השיחה (לולאה)
+        response.gather(
             input='speech',
-            action='/twilio/handle_speech',
-            method='POST',
-            timeout=3,
-            speechTimeout='auto',
-            language='he-IL'
+            action='/handle_speech',
+            language=HEBREW_LANGUAGE_CODE,
+            speech_timeout='auto'
         )
-        resp.append(gather)
-        return str(resp)
-
-    print(f"User said: {user_speech}")
-
-    llm_response = call_llm_api(user_speech, call_sid)
-    wav_url = generate_tts_wav(llm_response, call_sid)
-    
-    if wav_url:
-        resp.play(url=request.url_root + wav_url)
-        cleanup_wav_file(os.path.join(app.static_folder, os.path.basename(wav_url)))
+        
     else:
-        resp.say(llm_response, voice='Polly.Amy', language='he-IL')
+        # הודעת שגיאה במקרה של חוסר קלט
+        response.say("לא שמעתי אותך. תוכל לחזור על דבריך?", language=HEBREW_LANGUAGE_CODE, voice=HEBREW_VOICE)
+        response.gather(
+            input='speech',
+            action='/handle_speech',
+            language=HEBREW_LANGUAGE_CODE,
+            speech_timeout='auto'
+        )
 
-    gather = Gather(
-        input='speech',
-        action='/twilio/handle_speech',
-        method='POST',
-        timeout=3,
-        speechTimeout='auto',
-        language='he-IL'
-    )
-    
-    resp.append(gather)
-    
-    return str(resp)
+    return str(response)
 
-# --- 5. בדיקת בריאות ---
-
-@app.route("/")
-def health_check():
-    return "Flask server is running on Railway and ready for Twilio calls!"
-
-# --- 6. הרצת השרת ---
-
+# --- נקודת כניסה לשרת ---
 if __name__ == "__main__":
-    if not os.path.exists(app.static_folder):
-        os.makedirs(app.static_folder)
-    
     port = int(os.environ.get("PORT", 5000))
-    app.run(host='0.0.0.0', port=port)
+    app.run(debug=True, host='0.0.0.0', port=port)

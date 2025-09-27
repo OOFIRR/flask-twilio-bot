@@ -8,8 +8,9 @@ import tempfile
 from flask import Flask, request, jsonify
 from twilio.twiml.voice_response import VoiceResponse, Gather
 
-# ייבוא נכון של elevenlabs
-from elevenlabs import set_api_key, generate, save
+# ייבוא נכון של elevenlabs (הייבוא החדש)
+from elevenlabs.client import ElevenLabs
+from elevenlabs import set_api_key, save
 from elevenlabs.api.error import APIError
 
 # --- 1. הגדרות וטעינת מפתחות API ---
@@ -20,13 +21,17 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 # חדש: טוען את מזהה הקול ממשתני הסביבה כדי לאפשר שינוי קל
 HEBREW_VOICE_ID = os.environ.get("ELEVENLABS_VOICE_ID", "MTfTLiL7VOpWnuOQqiyV")
 
+# יצירת מופע של ElevenLabs Client
+ELEVENLABS_CLIENT = None
 
 # הגדרת ElevenLabs API אם המפתח קיים
 if ELEVENLABS_API_KEY:
     try:
         # הפונקציה set_api_key מוגדרת פעם אחת
         set_api_key(ELEVENLABS_API_KEY)
-        print("ElevenLabs API key successfully loaded.")
+        # יצירת לקוח חדש
+        ELEVENLABS_CLIENT = ElevenLabs(api_key=ELEVENLABS_API_KEY)
+        print("ElevenLabs API key and client successfully loaded.")
     except Exception as e:
         print(f"Error setting ElevenLabs API key. TTS will use Twilio Say fallback. Error: {e}")
 
@@ -38,6 +43,7 @@ app = Flask(__name__, static_url_path='/static', static_folder='static')
 
 # --- 3. פונקציות עזר ---
 
+# פונקציה call_llm_api... (ללא שינוי)
 def call_llm_api(prompt, call_sid):
     """מתקשר ל-LLM של Gemini באמצעות מפתח OpenAI API."""
     if not OPENAI_API_KEY:
@@ -107,8 +113,8 @@ def generate_tts_wav(text_to_speak, call_sid):
     יוצר קובץ WAV באמצעות ElevenLabs ומחזיר את הנתיב לקובץ הסטטי.
     אם ElevenLabs נכשל, מחזיר None.
     """
-    if not ELEVENLABS_API_KEY:
-        print("ElevenLabs API key missing. Falling back to Twilio Say.")
+    if not ELEVENLABS_CLIENT:
+        print("ElevenLabs client not initialized. Falling back to Twilio Say.")
         return None
         
     try:
@@ -116,14 +122,15 @@ def generate_tts_wav(text_to_speak, call_sid):
         filename = f"{call_sid}_{int(time.time())}.wav"
         filepath = os.path.join(app.static_folder, filename)
         
-        # יצירת האודיו באמצעות ElevenLabs
-        audio = generate(
+        # יצירת האודיו באמצעות ElevenLabs (שימוש ב-Client החדש)
+        audio = ELEVENLABS_CLIENT.generate(
             text=text_to_speak,
             voice=HEBREW_VOICE_ID, # משתמש בקול המשובט (או ברירת מחדל)
             model="eleven_multilingual_v2" 
         )
         
         # שמירת קובץ ה-PCM שהתקבל כקובץ WAV
+        # הפונקציה save נשארת זמינה לייבוא
         save(audio, filepath)
         
         # כתובת URL ציבורית לקובץ (בתוך שרת Flask)

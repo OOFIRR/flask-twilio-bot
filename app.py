@@ -8,58 +8,58 @@ from twilio.twiml.voice_response import VoiceResponse, Gather
 app = Flask(__name__)
 
 # הגדרת משתני סביבה.
-# OPENAI_API_KEY משמש עבור קריאות ל-Gemini API (דרך requests).
+# ***שינוי קריטי: טוען את המפתח כ-OPENAI_API_KEY***
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY") 
 HEBREW_LANGUAGE_CODE = "he-IL" 
 
-# נשתמש בקול מפורש של Amazon Polly (Polly.Amy) שתומך בשפות רבות 
-# בניסיון לעקוף את בעיית ה-TTS העברי המובנה של Twilio
-HEBREW_VOICE = "Polly.Amy" 
+# נשתמש בקול אנגלי (Polly.Salli) שהוא יציב יותר ב-Twilio,
+# וניתן לו לדבר את הטקסט העברי. זה יישמע במבטא זר, אבל ימנע התנתקות.
+HEBREW_VOICE = "Polly.Salli" 
 
 # --- פונקציית LLM ---
 def call_llm_api(prompt):
     """
-    מתקשרת ל-Gemini API לקבלת תשובה.
+    מתקשרת ל-OpenAI API (GPT-3.5) לקבלת תשובה.
     """
     if not OPENAI_API_KEY:
-        return "אני מצטער, אבל מודל השפה כרגע אינו זמין."
+        return "אני מצטער, אבל מודל השפה כרגע אינו זמין. חסר מפתח OpenAI."
 
-    # הגדרת ההנחיה המערכתית (System Instruction)
-    system_instruction = "אתה בוט טלפוני בעברית, חברותי, ענייני וממוקד. ענה בקצרה, בטון קול טבעי, כאילו אתה מדבר בטלפון."
-    
-    # בניית ההודעות
+    # הגדרת השיחה
     messages = [
+        {"role": "system", "content": "אתה בוט טלפוני בעברית, חברותי, ענייני וממוקד. ענה בקצרה, בטון קול טבעי, כאילו אתה מדבר בטלפון."},
         {"role": "user", "content": prompt}
     ]
 
     try:
-        # בניית ה-URL וה-Payload לקריאה ישירה ל-Gemini API
-        api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent?key={OPENAI_API_KEY}"
-        
-        # מבנה ה-contents כולל את היסטוריית השיחה (רק ההודעה הנוכחית במקרה זה)
-        contents = [{"parts": [{"text": msg['content']}]} for msg in messages]
+        # בניית ה-URL וה-Payload לקריאה ל-OpenAI API
+        api_url = "https://api.openai.com/v1/chat/completions"
         
         payload = {
-            "contents": contents,
-            "systemInstruction": {"parts": [{"text": system_instruction}]},
-            "config": {"maxOutputTokens": 150, "temperature": 0.7}
+            "model": "gpt-3.5-turbo", # מודל יציב ומהיר
+            "messages": messages,
+            "max_tokens": 150,
+            "temperature": 0.7
         }
 
         # ביצוע הקריאה ל-API
         response = requests.post(
             api_url, 
-            headers={'Content-Type': 'application/json'}, 
+            headers={
+                'Content-Type': 'application/json',
+                # שימוש במפתח OpenAI
+                'Authorization': f'Bearer {OPENAI_API_KEY}' 
+            }, 
             json=payload
         )
         response.raise_for_status() # זורק שגיאה אם הסטטוס אינו 2xx
 
         result = response.json()
         # חילוץ התשובה
-        text_response = result.get('candidates', [{}])[0].get('content', {}).get('parts', [{}])[0].get('text', "מודל השפה לא הצליח להגיב.")
+        text_response = result['choices'][0]['message']['content']
         return text_response.strip()
 
     except Exception as e:
-        print(f"LLM API Call Failed: {e}")
+        print(f"OpenAI API Call Failed: {e}")
         return "אני מצטער, חלה תקלה בשירות השפה. אנא נסה שוב."
 
 
@@ -73,8 +73,8 @@ def voice():
     
     initial_prompt = "שלום, הגעת לבוט הטלפוני. איך אוכל לעזור לך היום?"
     
-    print("Using Twilio default Say with explicit Hebrew Voice (Polly.Amy).")
-    # הפעלת TTS עם הקול המפורש
+    print("Using Twilio default Say with non-Hebrew, stable voice (Polly.Salli).")
+    # שימוש בקול יציב (Salli) עבור הקול, ושמירה על הגדרת השפה העברית עבור זיהוי דיבור.
     response.say(initial_prompt, language=HEBREW_LANGUAGE_CODE, voice=HEBREW_VOICE) 
 
     # בקשה לאיסוף הקלט הקולי של המשתמש (Gather)
@@ -104,7 +104,7 @@ def handle_speech():
         print(f"LLM response: {llm_response_text}")
 
         # שימוש ב-Say המובנה של Twilio
-        print("Using Twilio default Say with explicit Hebrew Voice (Polly.Amy).")
+        print("Using Twilio default Say with non-Hebrew, stable voice (Polly.Salli).")
         response.say(llm_response_text, language=HEBREW_LANGUAGE_CODE, voice=HEBREW_VOICE)
 
         # איסוף קלט נוסף כדי להמשיך את השיחה (לולאה)

@@ -9,10 +9,10 @@ app = Flask(__name__)
 
 # הגדרת משתני סביבה.
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY") 
-HEBREW_LANGUAGE_CODE = "he-IL" 
+# *** תיקון קריטי: שימוש בקוד השפה המומלץ ל-Twilio TTS ***
+HEBREW_LANGUAGE_CODE = "iw-IL" 
 
-# *** תיקון קריטי למהירות: שימוש בקול STANDARD המהיר (במקום WaveNet האיטי) ***
-# Twilio ממליץ על Standard לקבלת Latency נמוך בשיחות בזמן אמת.
+# *** שימוש בקול STANDARD המהיר (המלצת Twilio) ***
 LLM_HEBREW_VOICE = "Google.he-IL-Standard-A" 
 
 # --- פונקציית LLM ---
@@ -62,40 +62,49 @@ def call_llm_api(prompt):
 @app.route("/voice", methods=['GET', 'POST'])
 def voice():
     """
-    נקודת הכניסה לשיחת הטלפון. מחזירה TwiML עם בקשה לקלט קולי.
+    נקודת הכניסה לשיחת הטלפון. מחזירה TwiML עם בקשה לקלט מקשים.
     """
     response = VoiceResponse()
     
-    initial_prompt = "שלום, הגעת לבוט הטלפוני. איך אוכל לעזור לך היום?"
+    # *** שינוי הוראה: המשתמש צריך להקליד מספר ***
+    initial_prompt = "שלום, הגעת לבוט הטלפוני. מכיוון שאנו עדיין לא תומכים בזיהוי דיבור בעברית, אנא הקלד מספר מ-1 עד 9 בכדי לשאול שאלה כללית. נגיב לך בקול."
     
-    # שימוש בקול Standard כדי להבטיח שהוא יעבור
     print(f"Using Standard voice ({LLM_HEBREW_VOICE}) for initial prompt.")
     response.say(initial_prompt, language=HEBREW_LANGUAGE_CODE, voice=LLM_HEBREW_VOICE) 
 
-    # *** הגדרות Gather מחמירות ליציבות ומהירות ***
+    # *** מעבר ל-DTMF: איסוף מקשים (Digits) ***
     response.gather(
-        input='speech',
+        input='dtmf', # מקבל קלט מקשים במקום קול
+        num_digits=1, # מצפה לקליטת ספרה אחת (1-9)
         action='/handle_speech',
-        language=HEBREW_LANGUAGE_CODE,
-        timeout='7',           # זמן המתנה כולל ארוך יותר
-        speechTimeout='2'      # סיום האזנה 2 שניות אחרי הפסקה (מומלץ ולא auto)
+        timeout='10' # זמן המתנה ארוך יותר
     )
     
     return str(response)
 
-# --- Webhook לטיפול בקלט קולי ---
+# --- Webhook לטיפול בקלט מקשים (DTMF) ---
 @app.route("/handle_speech", methods=['POST'])
 def handle_speech():
     """
-    מקבל את הדיבור של המשתמש, שולח ל-LLM ומחזיר את התשובה.
+    מקבל את המקשים של המשתמש, שולח ל-LLM ומחזיר את התשובה.
     """
     response = VoiceResponse()
-    # Twilio שולח את התוצאה ל-SpeechResult
-    spoken_text = request.form.get('SpeechResult') 
+    # *** שינוי קריטי: מקבל קלט מ-Digits במקום SpeechResult ***
+    digits_result = request.form.get('Digits') 
     
-    # *** התחלת הלולאה ***
-    if spoken_text:
-        print(f"User said: {spoken_text}")
+    # המרת קלט המקשים לשאלה עבור ה-LLM
+    if digits_result:
+        # דוגמה לשאלה קבועה המבוססת על הקלט המספרי
+        question_map = {
+            '1': "מה מזג האוויר הצפוי למחר בתל אביב?",
+            '2': "מהי הדרך הטובה ביותר ללמוד פייתון למתחילים?",
+            '3': "מהם שלושה טיפים לשינה טובה?",
+            # נוסיף שאלה ברירת מחדל אם הקליד מספר אחר
+        }
+        
+        spoken_text = question_map.get(digits_result, f"הקשת את הספרה {digits_result}. אנא ענה על שאלה כללית בנושא טכנולוגיה.")
+
+        print(f"User pressed: {digits_result}. Question sent to LLM: {spoken_text}")
         
         # קריאה ל-LLM
         llm_response_text = call_llm_api(spoken_text)
@@ -105,29 +114,20 @@ def handle_speech():
         print(f"Using fast Google Standard Hebrew voice ({LLM_HEBREW_VOICE}) for LLM response.")
         response.say(llm_response_text, language=HEBREW_LANGUAGE_CODE, voice=LLM_HEBREW_VOICE)
 
-        # איסוף קלט נוסף כדי להמשיך את השיחה (חזרה ל-/handle_speech)
+        # איסוף קלט נוסף כדי להמשיך את השיחה (לולאה)
+        # *** חוזר למצב קליטת DTMF ***
+        response.say("אם ברצונך לשאול שאלה נוספת, אנא הקלד שוב מספר מ-1 עד 9.", language=HEBREW_LANGUAGE_CODE, voice=LLM_HEBREW_VOICE)
         response.gather(
-            input='speech',
+            input='dtmf',
+            num_digits=1,
             action='/handle_speech',
-            language=HEBREW_LANGUAGE_CODE,
-            timeout='7',
-            speechTimeout='2'
+            timeout='10'
         )
         
     else:
-        # אם לא התקבל קלט (כי המשתמש שתק או השיחה נותקה מוקדם)
-        response.say("לא שמעתי אותך. אנא נסה לומר משהו שוב.", language=HEBREW_LANGUAGE_CODE, voice=LLM_HEBREW_VOICE)
-        # מחזירים את הפונקציה לתחילת הלולאה
-        response.gather(
-            input='speech',
-            action='/handle_speech',
-            language=HEBREW_LANGUAGE_CODE,
-            timeout='7',
-            speechTimeout='2'
-        )
-    
-    # *** תיקון קריטי: הסרת הניתוק הגורף (response.hangup()) מחוץ לבלוק ה-if. ***
-    # כל עוד ה-TwiML תקין, ה-Gather תמיד יופעל שוב, והשיחה לא תנותק.
+        # אם לא התקבל קלט, מנתקים
+        response.say("לא התקבלה קליטה. להתראות.", language=HEBREW_LANGUAGE_CODE, voice=LLM_HEBREW_VOICE)
+        response.hangup()
     
     return str(response)
 

@@ -11,8 +11,9 @@ app = Flask(__name__)
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY") 
 HEBREW_LANGUAGE_CODE = "he-IL" 
 
-# הקול הרשמי של גוגל עבור עברית (נשתמש בו לתשובות ה-LLM)
-LLM_HEBREW_VOICE = "Google.he-IL-Standard-A" 
+# *** שינוי קריטי לשיפור מהירות (Latency): שימוש בקול WaveNet ***
+# Google.he-IL-Wavenet-A הוא הקול המהיר ביותר לייצור (Low Latency TTS).
+LLM_HEBREW_VOICE = "Google.he-IL-Wavenet-A" 
 # קול ברירת מחדל יציב של Twilio עבור הודעת הפתיחה בלבד
 TWILIO_DEFAULT_VOICE = "woman" 
 
@@ -27,7 +28,8 @@ def call_llm_api(prompt):
 
     # הגדרת השיחה
     messages = [
-        {"role": "system", "content": "אתה בוט טלפוני בעברית, חברותי, ענייני וממוקד. ענה בקצרה, בטון קול טבעי, כאילו אתה מדבר בטלפון."},
+        # *** שינוי: הוספת הוראה להיות קצר מאוד ***
+        {"role": "system", "content": "אתה בוט טלפוני בעברית. ענה בקצרה, בתמציתיות ובטון חברותי וממוקד, כאילו אתה מדבר בטלפון."},
         {"role": "user", "content": prompt}
     ]
 
@@ -36,9 +38,10 @@ def call_llm_api(prompt):
         api_url = "https://api.openai.com/v1/chat/completions"
         
         payload = {
-            "model": "gpt-3.5-turbo", # מודל יציב ומהיר
+            "model": "gpt-3.5-turbo", 
             "messages": messages,
-            "max_tokens": 150,
+            # *** שינוי: קיצור אורך התשובה המקסימלי ל-100 טוקנים ***
+            "max_tokens": 100,
             "temperature": 0.7
         }
 
@@ -73,7 +76,7 @@ def voice():
     
     initial_prompt = "שלום, הגעת לבוט הטלפוני. איך אוכל לעזור לך היום?"
     
-    # *** שינוי: שימוש בקול ברירת המחדל היציב (woman) רק עבור הפתיחה ***
+    # שימוש בקול ברירת המחדל היציב (woman) רק עבור הפתיחה
     print(f"Using Twilio DEFAULT voice ({TWILIO_DEFAULT_VOICE}) for initial prompt to prevent crash.")
     response.say(initial_prompt, language=HEBREW_LANGUAGE_CODE, voice=TWILIO_DEFAULT_VOICE) 
 
@@ -82,7 +85,8 @@ def voice():
         input='speech',
         action='/handle_speech',
         language=HEBREW_LANGUAGE_CODE,
-        speech_timeout='auto'
+        # *** שינוי קריטי: קיצור זמן ההמתנה לקלט קולי ***
+        speechTimeout='2'
     )
     
     return str(response)
@@ -103,8 +107,8 @@ def handle_speech():
         llm_response_text = call_llm_api(spoken_text)
         print(f"LLM response: {llm_response_text}")
 
-        # *** שינוי: שימוש בקול העברי (Google TTS) עבור התשובה האמיתית ***
-        print(f"Using explicit Google Hebrew voice ({LLM_HEBREW_VOICE}) for LLM response.")
+        # שימוש בקול WaveNet המהיר
+        print(f"Using fast Google WaveNet Hebrew voice ({LLM_HEBREW_VOICE}) for LLM response.")
         response.say(llm_response_text, language=HEBREW_LANGUAGE_CODE, voice=LLM_HEBREW_VOICE)
 
         # איסוף קלט נוסף כדי להמשיך את השיחה (לולאה)
@@ -112,7 +116,8 @@ def handle_speech():
             input='speech',
             action='/handle_speech',
             language=HEBREW_LANGUAGE_CODE,
-            speech_timeout='auto'
+            # *** שינוי קריטי: קיצור זמן ההמתנה לקלט קולי ***
+            speechTimeout='2' 
         )
         
     else:
@@ -122,7 +127,7 @@ def handle_speech():
             input='speech',
             action='/handle_speech',
             language=HEBREW_LANGUAGE_CODE,
-            speech_timeout='auto'
+            speechTimeout='2'
         )
 
     return str(response)

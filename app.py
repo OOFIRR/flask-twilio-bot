@@ -8,13 +8,13 @@ from twilio.twiml.voice_response import VoiceResponse, Gather
 app = Flask(__name__)
 
 # הגדרת משתני סביבה.
-# ***שינוי קריטי: טוען את המפתח כ-OPENAI_API_KEY***
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY") 
 HEBREW_LANGUAGE_CODE = "he-IL" 
 
-# נשתמש בקול אנגלי (Polly.Salli) שהוא יציב יותר ב-Twilio,
-# וניתן לו לדבר את הטקסט העברי. זה יישמע במבטא זר, אבל ימנע התנתקות.
-HEBREW_VOICE = "Polly.Salli" 
+# הקול הרשמי של גוגל עבור עברית (נשתמש בו לתשובות ה-LLM)
+LLM_HEBREW_VOICE = "Google.he-IL-Standard-A" 
+# קול ברירת מחדל יציב של Twilio עבור הודעת הפתיחה בלבד
+TWILIO_DEFAULT_VOICE = "woman" 
 
 # --- פונקציית LLM ---
 def call_llm_api(prompt):
@@ -22,6 +22,7 @@ def call_llm_api(prompt):
     מתקשרת ל-OpenAI API (GPT-3.5) לקבלת תשובה.
     """
     if not OPENAI_API_KEY:
+        # הודעת שגיאה זו תושמע על ידי ה-Say fallback של Twilio.
         return "אני מצטער, אבל מודל השפה כרגע אינו זמין. חסר מפתח OpenAI."
 
     # הגדרת השיחה
@@ -46,7 +47,6 @@ def call_llm_api(prompt):
             api_url, 
             headers={
                 'Content-Type': 'application/json',
-                # שימוש במפתח OpenAI
                 'Authorization': f'Bearer {OPENAI_API_KEY}' 
             }, 
             json=payload
@@ -73,9 +73,9 @@ def voice():
     
     initial_prompt = "שלום, הגעת לבוט הטלפוני. איך אוכל לעזור לך היום?"
     
-    print("Using Twilio default Say with non-Hebrew, stable voice (Polly.Salli).")
-    # שימוש בקול יציב (Salli) עבור הקול, ושמירה על הגדרת השפה העברית עבור זיהוי דיבור.
-    response.say(initial_prompt, language=HEBREW_LANGUAGE_CODE, voice=HEBREW_VOICE) 
+    # *** שינוי: שימוש בקול ברירת המחדל היציב (woman) רק עבור הפתיחה ***
+    print(f"Using Twilio DEFAULT voice ({TWILIO_DEFAULT_VOICE}) for initial prompt to prevent crash.")
+    response.say(initial_prompt, language=HEBREW_LANGUAGE_CODE, voice=TWILIO_DEFAULT_VOICE) 
 
     # בקשה לאיסוף הקלט הקולי של המשתמש (Gather)
     response.gather(
@@ -103,9 +103,9 @@ def handle_speech():
         llm_response_text = call_llm_api(spoken_text)
         print(f"LLM response: {llm_response_text}")
 
-        # שימוש ב-Say המובנה של Twilio
-        print("Using Twilio default Say with non-Hebrew, stable voice (Polly.Salli).")
-        response.say(llm_response_text, language=HEBREW_LANGUAGE_CODE, voice=HEBREW_VOICE)
+        # *** שינוי: שימוש בקול העברי (Google TTS) עבור התשובה האמיתית ***
+        print(f"Using explicit Google Hebrew voice ({LLM_HEBREW_VOICE}) for LLM response.")
+        response.say(llm_response_text, language=HEBREW_LANGUAGE_CODE, voice=LLM_HEBREW_VOICE)
 
         # איסוף קלט נוסף כדי להמשיך את השיחה (לולאה)
         response.gather(
@@ -117,7 +117,7 @@ def handle_speech():
         
     else:
         # הודעת שגיאה במקרה של חוסר קלט
-        response.say("לא שמעתי אותך. תוכל לחזור על דבריך?", language=HEBREW_LANGUAGE_CODE, voice=HEBREW_VOICE)
+        response.say("לא שמעתי אותך. תוכל לחזור על דבריך?", language=HEBREW_LANGUAGE_CODE, voice=LLM_HEBREW_VOICE)
         response.gather(
             input='speech',
             action='/handle_speech',

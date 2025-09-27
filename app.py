@@ -72,7 +72,7 @@ def voice():
     print(f"Using Standard voice ({LLM_HEBREW_VOICE}) for initial prompt.")
     response.say(initial_prompt, language=HEBREW_LANGUAGE_CODE, voice=LLM_HEBREW_VOICE) 
 
-    # *** שינוי קריטי: הגדרות Gather מחמירות ליציבות ומהירות ***
+    # *** הגדרות Gather מחמירות ליציבות ומהירות ***
     response.gather(
         input='speech',
         action='/handle_speech',
@@ -122,6 +122,12 @@ def handle_speech():
             timeout='7',
             speechTimeout='2'
         )
+    
+    # *** הוספה קריטית: הניתוק מוודא סגירת לולאה במקרה של כשל ***
+    # אם ה-Gather נכשל מכל סיבה שהיא, הבוט יגיד "להתראות" וינתק בצורה מסודרת
+    response.say("להתראות, היתה לי שיחה נעימה.", language=HEBREW_LANGUAGE_CODE, voice=LLM_HEBREW_VOICE)
+    response.hangup()
+
 
     return str(response)
 

@@ -7,27 +7,28 @@ import uuid
 import tempfile
 from flask import Flask, request, jsonify
 from twilio.twiml.voice_response import VoiceResponse, Gather
-# ייבוא נכון של elevenlabs (עם set_api_key, generate ו-save)
+
+# ייבוא נכון של elevenlabs
 from elevenlabs import set_api_key, generate, save
 from elevenlabs.api.error import APIError
 
 # --- 1. הגדרות וטעינת מפתחות API ---
 
-# טוען משתני סביבה. אם מפתח ElevenLabs או OpenAI חסר, השרת ימשיך לרוץ
-# וישתמש בגיבויים או יפספס את היכולת הרלוונטית, אך לא יקרוס.
+# טוען משתני סביבה מהגדרות Railway
 ELEVENLABS_API_KEY = os.environ.get("ELEVENLABS_API_KEY")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+# חדש: טוען את מזהה הקול ממשתני הסביבה כדי לאפשר שינוי קל
+HEBREW_VOICE_ID = os.environ.get("ELEVENLABS_VOICE_ID", "MTfTLiL7VOpWnuOQqiyV")
+
 
 # הגדרת ElevenLabs API אם המפתח קיים
 if ELEVENLABS_API_KEY:
     try:
+        # הפונקציה set_api_key מוגדרת פעם אחת
         set_api_key(ELEVENLABS_API_KEY)
         print("ElevenLabs API key successfully loaded.")
     except Exception as e:
-        print(f"Error setting ElevenLabs API key: {e}")
-
-# שינוי קריטי: מזהה הקול האישי שלך מ-ElevenLabs
-HEBREW_VOICE_ID = "MTfTLiL7VOpWnuOQqiyV" # *** ID הקול האישי של המשתמש ***
+        print(f"Error setting ElevenLabs API key. TTS will use Twilio Say fallback. Error: {e}")
 
 # היסטוריית שיחה (לצורך שמירת הקונטקסט)
 CALL_CONTEXT = {}
@@ -57,7 +58,7 @@ def call_llm_api(prompt, call_sid):
         "parts": [{"text": "אתה עוזר קולי בעברית שמספק תשובות קצרות ותכליתיות. ענה בצורה ידידותית, קצרה וטבעית. אם המשתמש שואל שאלות מורכבות מדי, בקש ממנו לשאול שאלות פשוטות יותר."}]
     }
 
-    # כתובת ה-API של Gemini (תיקון אחרון לשגיאת 404)
+    # כתובת ה-API של Gemini (תיקון סופי ל-404)
     api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent?key={OPENAI_API_KEY}"
     
     payload = {
@@ -88,7 +89,7 @@ def call_llm_api(prompt, call_sid):
         candidate = result.get('candidates', [{}])[0]
         text_response = candidate.get('content', {}).get('parts', [{}])[0].get('text', "מודל השפה לא הצליח להגיב.")
 
-        # הוספת תגובת המודל להיסטוריה
+        # הוספת תגובת המודל להיסטוריה ושמירת קונטקסט
         history.append({
             "role": "model",
             "parts": [{"text": text_response}]
@@ -98,7 +99,7 @@ def call_llm_api(prompt, call_sid):
 
     except requests.exceptions.RequestException as e:
         print(f"Error calling LLM API (Status: {response.status_code if 'response' in locals() else 'Unknown'}): {e}")
-        return "אני מצטער, חלה שגיאה בחיבור למודל השפה."
+        return "אני מצטער, חלה שגיאה בחיבור למודל השפה. אנא נסה שוב."
 
 
 def generate_tts_wav(text_to_speak, call_sid):
@@ -110,11 +111,6 @@ def generate_tts_wav(text_to_speak, call_sid):
         print("ElevenLabs API key missing. Falling back to Twilio Say.")
         return None
         
-    # בדיקה נוספת למקרה שהמשתמש שכח להחליף את ה-ID
-    if HEBREW_VOICE_ID == "YOUR_PERSONAL_VOICE_ID_HERE":
-         print("Warning: Voice ID is the default placeholder. Falling back to Twilio Say.")
-         return None
-
     try:
         # יצירת קובץ WAV ייחודי ושמירה בתיקיית static
         filename = f"{call_sid}_{int(time.time())}.wav"
@@ -123,7 +119,7 @@ def generate_tts_wav(text_to_speak, call_sid):
         # יצירת האודיו באמצעות ElevenLabs
         audio = generate(
             text=text_to_speak,
-            voice=HEBREW_VOICE_ID, # משתמש בקול המשובט שלך
+            voice=HEBREW_VOICE_ID, # משתמש בקול המשובט (או ברירת מחדל)
             model="eleven_multilingual_v2" 
         )
         
@@ -135,10 +131,11 @@ def generate_tts_wav(text_to_speak, call_sid):
         return static_url
 
     except APIError as e:
+        # שגיאת API אמיתית - סביר להניח שמפתח לא תקין או קול לא קיים
         print(f"ElevenLabs API Error: {e}. Falling back to Twilio Say.")
         return None
     except Exception as e:
-        print(f"General TTS Error: {e}. Falling back to Twilio Say.")
+        print(f"General TTS Error: {e}. Falling back to Twilio Say. Error: {e}")
         return None
     
     
@@ -164,12 +161,11 @@ def answer_call():
     welcome_text = "שלום! איך אפשר לעזור לך היום?"
     wav_url = generate_tts_wav(welcome_text, call_sid)
 
-    # אם ElevenLabs הצליח, נשתמש ב-Play. אחרת, נשתמש ב-Say של Twilio (קול אנגלי)
+    # אם ElevenLabs הצליח, נשתמש ב-Play. אחרת, נשתמש ב-Say של Twilio (קול גיבוי)
     if wav_url:
         resp.play(url=request.url_root + wav_url)
     else:
-        # גיבוי: משתמשים ב-Twilio Say
-        # Twilio Say אינו תומך בקולות משובטים, לכן נחזור לקול ברירת המחדל שלהם
+        # גיבוי: משתמשים ב-Twilio Say עם קול Polly.Amy (עברית)
         resp.say(welcome_text, voice='Polly.Amy', language='he-IL')
 
     # הגדרת Gather לקבלת קול המשתמש

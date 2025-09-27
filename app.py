@@ -90,8 +90,10 @@ def handle_speech():
     מקבל את הדיבור של המשתמש, שולח ל-LLM ומחזיר את התשובה.
     """
     response = VoiceResponse()
-    spoken_text = request.form.get('SpeechResult')
+    # Twilio שולח את התוצאה ל-SpeechResult
+    spoken_text = request.form.get('SpeechResult') 
     
+    # *** התחלת הלולאה ***
     if spoken_text:
         print(f"User said: {spoken_text}")
         
@@ -103,7 +105,7 @@ def handle_speech():
         print(f"Using fast Google Standard Hebrew voice ({LLM_HEBREW_VOICE}) for LLM response.")
         response.say(llm_response_text, language=HEBREW_LANGUAGE_CODE, voice=LLM_HEBREW_VOICE)
 
-        # איסוף קלט נוסף כדי להמשיך את השיחה (לולאה)
+        # איסוף קלט נוסף כדי להמשיך את השיחה (חזרה ל-/handle_speech)
         response.gather(
             input='speech',
             action='/handle_speech',
@@ -113,8 +115,9 @@ def handle_speech():
         )
         
     else:
-        # הודעת שגיאה במקרה של חוסר קלט או ניתוק קולי
+        # אם לא התקבל קלט (כי המשתמש שתק או השיחה נותקה מוקדם)
         response.say("לא שמעתי אותך. אנא נסה לומר משהו שוב.", language=HEBREW_LANGUAGE_CODE, voice=LLM_HEBREW_VOICE)
+        # מחזירים את הפונקציה לתחילת הלולאה
         response.gather(
             input='speech',
             action='/handle_speech',
@@ -123,12 +126,9 @@ def handle_speech():
             speechTimeout='2'
         )
     
-    # *** הוספה קריטית: הניתוק מוודא סגירת לולאה במקרה של כשל ***
-    # אם ה-Gather נכשל מכל סיבה שהיא, הבוט יגיד "להתראות" וינתק בצורה מסודרת
-    response.say("להתראות, היתה לי שיחה נעימה.", language=HEBREW_LANGUAGE_CODE, voice=LLM_HEBREW_VOICE)
-    response.hangup()
-
-
+    # *** תיקון קריטי: הסרת הניתוק הגורף (response.hangup()) מחוץ לבלוק ה-if. ***
+    # כל עוד ה-TwiML תקין, ה-Gather תמיד יופעל שוב, והשיחה לא תנותק.
+    
     return str(response)
 
 # --- נקודת כניסה לשרת ---

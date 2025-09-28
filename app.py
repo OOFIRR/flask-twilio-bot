@@ -44,15 +44,20 @@ GCP_CREDENTIALS_FILE_PATH = None
 
 if GCP_CREDENTIALS_JSON:
     try:
-        # 1. יצירת קובץ זמני
+        # 1. ודא שהתוכן הוא JSON תקין והסר רווחים/תווים מיותרים
+        credentials_dict = json.loads(GCP_CREDENTIALS_JSON)
+        # 2. כתיבת ה-JSON (בפורמט נקי) לקובץ זמני
         with tempfile.NamedTemporaryFile(mode='w', delete=False) as temp_file:
-            temp_file.write(GCP_CREDENTIALS_JSON)
+            # שימוש ב-json.dump מבטיח כתיבה תקינה של המבנה
+            json.dump(credentials_dict, temp_file)
             GCP_CREDENTIALS_FILE_PATH = temp_file.name
-        logger.info(f"Google Cloud Credentials saved to temporary file: {GCP_CREDENTIALS_FILE_PATH}")
+        logger.info(f"Google Cloud Credentials successfully processed and saved to temporary file: {GCP_CREDENTIALS_FILE_PATH}")
         
+    except json.JSONDecodeError as e:
+        logger.error(f"ERROR: Failed to parse GCP Credentials JSON. Check syntax and ensure no extra spaces/chars: {e}")
+        GCP_CREDENTIALS_FILE_PATH = None
     except Exception as e:
-        logger.error(f"ERROR: Failed to create temporary GCP Credentials file. Check JSON format: {e}")
-        # אם יש שגיאה ב-JSON, נגדיר את הנתיב ל-None כדי להפעיל Mock
+        logger.error(f"ERROR: Failed to create temporary GCP Credentials file: {e}")
         GCP_CREDENTIALS_FILE_PATH = None
 
 # אתחול הלקוחות
@@ -195,7 +200,7 @@ def transcribe_audio_from_chunks(audio_chunks: list) -> str:
         return ""
 
     except Exception as e:
-        # אם יש שגיאה בחיבור או בהרשאות (כמו 403), זה ייתפס כאן
+        # אם יש שגיאה בחיבור או בהרשאות (כמו 401), זה ייתפס כאן
         logger.error(f"Google Cloud STT ERROR (Check Permissions/API Enablement!): {e}")
         # אם יש שגיאה, נחזור ל-Mock כדי לא לגרום לקריסה
         mock_response = "אירעה שגיאה בשירות התמלול, אני אשתמש בטקסט חלופי כרגע."
@@ -272,6 +277,9 @@ def voice():
         voice='Google.he-IL-Standard-A'
     )
     
+    # הוספת צפצוף מפורש כדי לסמן את תחילת ההקלטה
+    resp.play(digits='beep')
+
     # חיבור ל-WebSocket
     connect = resp.connect()
     connect.stream(name='Hebrew_STT', url=WEBSOCKET_URL)

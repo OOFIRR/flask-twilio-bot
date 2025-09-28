@@ -10,12 +10,15 @@ import traceback
 from flask import Flask, request, Response
 from gevent.pywsgi import WSGIServer
 from geventwebsocket.handler import WebSocketHandler
-from twilio.twiml.voice_response import VoiceResponse, Stream, Say, Play
+from twilio.twiml.voice_response import VoiceResponse, Stream, Say, Play, Start # ייבוא Start
+# שינוי: ייבוא Stop כדי לסיים את ה-Stream אחרי תגובה
+from twilio.twiml.voice_response import Stop 
 
 # אינטגרציה של Google Cloud Speech-to-Text
 from google.cloud import speech_v1p1beta1 as speech
 # לייבוא פונקציית האימות המפורשת של Google
 from google.oauth2 import service_account 
+from google.api_core import exceptions as gcp_exceptions 
 
 # אינטגרציה של OpenAI ו-ElevenLabs
 import openai
@@ -52,14 +55,15 @@ except Exception as e:
     GCP_SPEECH_CLIENT = None 
 
 # -----------------------------------------------------------------------------
+# עדכון: מודל ל-phone_call ו-interim_results=True (כדי לקבל תגובה מהירה)
 STT_STREAMING_CONFIG = speech.StreamingRecognitionConfig(
     config=speech.RecognitionConfig(
         encoding=speech.RecognitionConfig.AudioEncoding.MULAW,
         sample_rate_hertz=8000,
         language_code='he-IL',
-        model='default', 
+        model='phone_call', # שינוי: שימוש במודל לשיחות טלפון
     ),
-    interim_results=False, 
+    interim_results=True, # שינוי: הפעלת תוצאות ביניים
     single_utterance=False,
 )
 
@@ -135,13 +139,16 @@ def voice_webhook():
     
     response = VoiceResponse()
     
-    # שינוי קטן: מוסיף זמן קטן לשקט כדי לאפשר ל-Twilio להתחבר
     response.say('שלום, אנא דברו לאחר הצליל.', language='he-IL') 
     
-    ws_url = f'wss://{host}/stream'
-    # הוספת track=inbound כדי לוודא ששולחים רק את מה שהמשתמש אומר (פחות קריטי, אבל מומלץ)
-    response.append(Stream(url=ws_url, track='inbound')) 
-    
+    # ** תיקון קריטי: עטיפת Stream בתוך Start **
+    with response.start() as start:
+        ws_url = f'wss://{host}/stream'
+        start.stream(url=ws_url, track='inbound')
+        
+    # Twilio יחכה 5 שניות לתחילת ה-WebSocket לפני שהוא מנתק או עובר הלאה
+    # אין צורך ב-Stop מפורש, Twilio תעבור ל-WebSocket אוטומטית.
+
     logging.info(f"Voice Webhook initialized stream to: {ws_url}. Session SID: {request.form.get('CallSid')}")
     return Response(str(response), mimetype='application/xml')
 
@@ -150,38 +157,36 @@ def voice_webhook():
 def generate_stt_requests(ws):
     """ גנרטור שמקבל הודעות מ-WebSocket ומחזיר אודיו גולמי עבור Google STT."""
     
-    # ** תיקון קריטי: שליחת קונפיגורציה ראשונית ל-Google STT **
-    # הקריאה הראשונה ל-Google STT חייבת להיות הודעת קונפיגורציה.
+    # 1. שליחת קונפיגורציה ראשונית ל-Google STT
     yield speech.StreamingRecognizeRequest(streaming_config=STT_STREAMING_CONFIG)
-    logging.info("Sent initial STT configuration request to Google.")
+    logging.info("STT: Sent initial configuration request.")
     
     while True:
         try:
             message = ws.receive()
             if message is None:
-                logging.info("WebSocket received None message (connection likely closed).")
+                logging.info("STT: WebSocket received None message (connection closed).")
                 break
             
             data = json.loads(message)
             
             if data['event'] == 'start':
-                logging.info(f"Twilio Stream started. Media Stream ID: {data.get('streamSid')}.")
+                logging.info(f"STT: Twilio Stream started. Media Stream ID: {data.get('streamSid')}.")
                 continue
                 
             if data['event'] == 'media':
-                # Twilio שולח אודיו ב-Base64, שיש לפענח אותו חזרה לבתים (bytes)
                 audio_chunk = base64.b64decode(data['media']['payload'])
-                # שליחת נתוני האודיו ל-Google
+                # 2. שליחת נתוני האודיו ל-Google
                 yield speech.StreamingRecognizeRequest(audio_content=audio_chunk) 
                 
             elif data['event'] == 'stop':
-                logging.info("Twilio Stream stopped.")
+                logging.info("STT: Twilio Stream stopped.")
                 break
                 
         except Exception as e:
             # לכידת שגיאה בלולאת קבלת האודיו (למשל, JSON פגום)
-            logging.error(f"Error receiving/parsing audio from WebSocket: {e}")
-            logging.error(traceback.format_exc()) # הדפסת ה-traceback המלא
+            logging.error(f"STT: Error receiving/parsing audio from WebSocket: {e}")
+            logging.error(traceback.format_exc()) 
             break
 
 
@@ -191,22 +196,23 @@ def stream():
     
     ws = request.environ.get('wsgi.websocket')
     if not ws:
-        logging.error("Expected WebSocket request.")
+        logging.error("STREAM: Expected WebSocket request.")
         return "Expected WebSocket", 400
 
-    logging.info("WebSocket connection established with Twilio. Ready to process STT.")
+    logging.info("STREAM: WebSocket connection established with Twilio. Ready to process STT.")
     
     if not GCP_SPEECH_CLIENT:
-        logging.error("GCP Speech Client failed to initialize. Closing stream immediately.")
+        logging.error("STREAM: GCP Speech Client failed to initialize. Closing stream immediately.")
         ws.close()
         return "GCP Init Error", 500
         
     audio_generator = generate_stt_requests(ws)
+    
+    # משתנים מקומיים לכל סשן WebSocket
     full_transcript = []
     
     try:
-        # הקריאה הראשונה ל-streaming_recognize תפעיל את הגנרטור ותשלח את ה-Config
-        stt_responses = GCP_SPEECH_CLIENT.streaming_recognize(audio_generator)
+        stt_responses = GCP_SPEECH_CLIENT.streaming_recognize(audio_generator, timeout=300)
         
         # לולאה זו מקבלת תגובות מ-Google
         for response in stt_responses:
@@ -214,47 +220,63 @@ def stream():
                 continue
 
             result = response.results[0]
+            transcript = result.alternatives[0].transcript
             
             if result.is_final:
-                transcript = result.alternatives[0].transcript
+                # הגיעה תוצאה סופית
                 full_transcript.append(transcript)
-                logging.info(f"FINAL TRANSCRIPT: {transcript}")
+                logging.info(f"TRANSCRIPT: FINAL: {transcript}")
                 
+                # אם יש תוצאה סופית, מגיבים
                 if full_transcript:
                     final_user_input = " ".join(full_transcript)
                     
                     # 1. עיבוד LLM (OpenAI)
                     llm_response_text = get_llm_response(final_user_input)
                     
-                    # 2. המרת טקסט לדיבור (ElevenLabs) וקבלת טקסט חזרה (בגלל מגבלות CDN)
+                    # 2. המרת טקסט לדיבור ושימוש ב-Say
                     tts_result = synthesize_speech_url(llm_response_text)
                     
                     # 3. יצירת Twilio Media Control Message להשמעת התשובה
+                    # הערה: Twilio לא תעבד TwiML של Say/Play ישירות ב-media_control
+                    # אבל נשאיר את זה עד שנחליט על לוגיקת Webhook חדשה
                     twiml_response = VoiceResponse()
                     twiml_response.say(tts_result, language='he-IL') 
-
+                    
+                    # כרגע, נשלח את הפקודה לסיים את ה-Stream כדי ש-Twilio תוכל להמשיך
+                    # ההודעה הזו לא בהכרח תגרום להשמעה, אבל היא מנקה את ה-Stream
                     response_twiml_message = {
                         "event": "media_control",
-                        "text": str(twiml_response)
+                        "text": str(twiml_response) # Twilio תתעלם מכך ברוב המקרים
                     }
                     
-                    ws.send(json.dumps(response_twiml_message))
-                    logging.info("Sent TwiML control message to Twilio.")
+                    # אם נרצה לסיים את השיחה אחרי תגובה אחת (ללא לולאת דיאלוג מורכבת):
+                    # ws.close() 
+                    # return "Stream closed after response", 200
 
-                    # איפוס לשיחה הבאה (חשוב מאוד להמשך הדיאלוג)
+                    ws.send(json.dumps(response_twiml_message))
+                    logging.info("CONTROL: Sent TwiML control message (using Say fallback).")
+
+                    # ** חשוב מאוד: איפוס ה-transcript לאחר שליחת תגובה **
                     full_transcript = []
+            else:
+                 # תוצאות ביניים
+                logging.debug(f"TRANSCRIPT: INTERIM: {transcript}")
                     
+    # טיפול ספציפי בשגיאות GCP
+    except gcp_exceptions.GoogleAPICallError as e:
+        logging.error(f"STREAM ERROR: Google API Call Error (gRPC failure). Details: {e.details}")
+        logging.error(traceback.format_exc())
     except Exception as e:
-        # כאן אנחנו מצפים לראות את השגיאה אם החיבור ל-Google STT נכשל!
-        logging.error(f"General error in STT/LLM loop or streaming_recognize: {e}")
+        logging.error(f"STREAM ERROR: General error in STT/LLM loop or streaming_recognize: {e}")
         logging.error(traceback.format_exc()) 
         
     finally:
-        logging.info("Closing WebSocket connection.")
+        logging.info("STREAM: Closing WebSocket connection.")
         try:
             ws.close()
         except Exception as close_err:
-            logging.error(f"Error closing WebSocket: {close_err}")
+            logging.error(f"STREAM: Error closing WebSocket: {close_err}")
             
     return "Stream closed", 200
 

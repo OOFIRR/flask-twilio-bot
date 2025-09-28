@@ -3,7 +3,7 @@ import json
 import base64
 import time
 import logging
-import io # נדרש לטיפול בבייטים של ElevenLabs
+import io 
 
 # אינטגרציה של Flask ו-WebSockets
 from flask import Flask, request, Response
@@ -13,6 +13,8 @@ from twilio.twiml.voice_response import VoiceResponse, Stream, Say, Play
 
 # אינטגרציה של Google Cloud Speech-to-Text
 from google.cloud import speech_v1p1beta1 as speech
+# לייבוא פונקציית האימות המפורשת של Google
+from google.oauth2 import service_account 
 
 # אינטגרציה של OpenAI ו-ElevenLabs
 import openai
@@ -25,12 +27,31 @@ app = Flask(__name__)
 # הגדרת משתני סביבה
 openai.api_key = os.environ.get('OPENAI_API_KEY', 'YOUR_OPENAI_API_KEY')
 ELEVEN_API_KEY = os.environ.get('ELEVEN_API_KEY', 'YOUR_ELEVEN_API_KEY')
-# VOICE_ID: קול עברי לדוגמה (Adam/Koren). יש להחליף ב-ID הקול המדויק שלך!
-# אם לא מוגדר, נשתמש ב-ID ידוע של Adam.
 VOICE_ID = os.environ.get('ELEVEN_VOICE_ID', 'EXa5x5N5kF7y5t2yJ90r') 
 
-# הגדרות Google STT
-GCP_SPEECH_CLIENT = speech.SpeechClient()
+# הגדרות Google STT - **העדכון מתבצע כאן!**
+# -----------------------------------------------------------------------------
+try:
+    # 1. קריאת מפתח השירות המלא (JSON) ממשתנה סביבה
+    GCP_CREDENTIALS_JSON = os.environ.get('GCP_CREDENTIALS_JSON')
+    if not GCP_CREDENTIALS_JSON:
+        raise ValueError("GCP_CREDENTIALS_JSON environment variable is not set.")
+
+    # 2. טעינת ה-JSON והכנת האובייקט Credentials
+    # משתמשים ב-json.loads כדי להמיר את המחרוזת לאובייקט
+    GCP_CREDENTIALS_INFO = json.loads(GCP_CREDENTIALS_JSON)
+    GCP_CREDENTIALS = service_account.Credentials.from_service_account_info(GCP_CREDENTIALS_INFO)
+    
+    # 3. יצירת הלקוח באמצעות ה-Credentials שנוצרו במפורש
+    GCP_SPEECH_CLIENT = speech.SpeechClient(credentials=GCP_CREDENTIALS)
+    logging.info("Google Speech Client initialized successfully using JSON credentials.")
+
+except Exception as e:
+    logging.error(f"FATAL: Failed to initialize Google Speech Client. Check GCP_CREDENTIALS_JSON format and environment variable setup. Error: {e}")
+    # אם האימות נכשל בשלב הטעינה, ניתוק מהיר
+    GCP_SPEECH_CLIENT = None 
+
+# -----------------------------------------------------------------------------
 STT_STREAMING_CONFIG = speech.StreamingRecognitionConfig(
     config=speech.RecognitionConfig(
         encoding=speech.RecognitionConfig.AudioEncoding.MULAW,
@@ -45,7 +66,7 @@ STT_STREAMING_CONFIG = speech.StreamingRecognitionConfig(
 # --- 2. פונקציות עזר לאינטגרציה ---
 
 def get_llm_response(prompt: str) -> str:
-    """שולח פרומפט ל-GPT-4o-mini ומחזיר תשובה."""
+# ... (הקוד נשאר זהה)
     logging.info(f"LLM Prompt: {prompt}")
     
     messages = [
@@ -68,27 +89,16 @@ def get_llm_response(prompt: str) -> str:
         return "אני מצטער, חלה שגיאה בשרת הדיאלוג."
 
 def upload_audio_to_cdn(audio_bytes: bytes) -> str:
-    """
-    *** פונקציית Placeholder! ***
-    Twilio דורשת URL ציבורי. בפרויקט אמיתי, קטע קוד זה מעלה את קובץ האודיו 
-    (שמתקבל מ-ElevenLabs) ל-S3, Google Cloud Storage, או לשרת CDN אחר, 
-    ומחזיר את ה-URL שלו.
-
-    כיוון שאנו מוגבלים, אנו לא יכולים ליישם העלאה אמיתית כאן.
-    לצורך הדגמה, אנו נחזור לפתרון ה-Say של Twilio.
-    אם נממש אחסון קבצים, זו תהיה הנקודה לשלב אותו.
-    """
+# ... (הקוד נשאר זהה)
     logging.warning("CDN Upload is not implemented. Returning placeholder URL for Twilio to use Say instead.")
     return "placeholder_url_for_say_fallback"
 
 
 def synthesize_speech_url(text: str) -> str:
-    """
-    שולח טקסט ל-ElevenLabs, ממיר לאודיו MP3, ומחזיר URL נגיש ל-Twilio.
-    """
+# ... (הקוד נשאר זהה)
     if not ELEVEN_API_KEY:
         logging.error("ElevenLabs API Key is missing. Falling back to Twilio Say.")
-        return text # במקרה חירום, מחזיר את הטקסט שיוקרא על ידי Twilio Say
+        return text 
         
     logging.info(f"Synthesizing speech for: '{text[:30]}...' using ElevenLabs.")
 
@@ -100,7 +110,7 @@ def synthesize_speech_url(text: str) -> str:
     }
     payload = {
         'text': text,
-        'model_id': 'eleven_multilingual_v2', # מודל רב-לשוני תומך בעברית
+        'model_id': 'eleven_multilingual_v2', 
         'voice_settings': {
             'stability': 0.5,
             'similarity_boost': 0.8
@@ -109,38 +119,28 @@ def synthesize_speech_url(text: str) -> str:
 
     try:
         resp = requests.post(url, headers=headers, json=payload)
-        resp.raise_for_status() # זורק שגיאה אם הסטטוס אינו 2xx
+        resp.raise_for_status() 
         
         audio_bytes = resp.content
         
-        # --- שלב העלאה ל-CDN (כרגע placeholder) ---
-        # בגלל מגבלות סביבת הקוד, אנחנו נחזור ל-Say למרות הקריאה ל-ElevenLabs
-        # אם קריאת ElevenLabs הצליחה, נשתמש בטקסט שהתקבל עבור Say.
         logging.warning("ElevenLabs successful, but returning text for Twilio Say (CDN not implemented).")
-        return text # מחזיר טקסט כדי שיוקרא על ידי Twilio Say
-        
-        # # אם היה לנו CDN:
-        # audio_url = upload_audio_to_cdn(audio_bytes)
-        # return audio_url
+        return text 
 
     except requests.exceptions.RequestException as e:
         logging.error(f"שגיאת ElevenLabs: {e}")
-        return text # במקרה של שגיאה, מחזיר טקסט כגיבוי (Fallback)
+        return text 
 
 # --- 3. Webhook לניהול שיחות (Twilio Voice) ---
 
 @app.route('/voice', methods=['POST'])
 def voice_webhook():
-    """מקבל שיחה נכנסת ומפנה ל-WebSocket Stream."""
-    
+# ... (הקוד נשאר זהה)
     host = request.headers.get('Host')
     
     response = VoiceResponse()
     
-    # ברכה קצרה בעברית
     response.say('שלום, אנא דברו לאחר הצליל.', language='he-IL')
     
-    # פתיחת Stream לקבלת אודיו ב‑WebSocket
     ws_url = f'wss://{host}/stream'
     response.append(Stream(url=ws_url))
     
@@ -150,11 +150,7 @@ def voice_webhook():
 # --- 4. לוגיקת WebSocket לתמלול ודיאלוג ---
 
 def generate_stt_requests(ws):
-    """
-    פונקציית Generator שמקבלת אודיו מה-WebSocket של Twilio
-    ושולחת אותו ל-Google STT.
-    """
-    # ... (קוד זהה לשליחת האודיו ל-GCP)
+# ... (הקוד נשאר זהה)
     while True:
         try:
             message = ws.receive()
@@ -180,6 +176,11 @@ def generate_stt_requests(ws):
 def stream():
     """נקודת קצה ל-WebSocket שמטפלת בזרם האודיו."""
     
+    # בדיקת אתחול לקוח Google Speech
+    if not GCP_SPEECH_CLIENT:
+        logging.error("GCP Speech Client failed to initialize. Cannot process stream.")
+        return "GCP Init Error", 500
+        
     ws = request.environ.get('wsgi.websocket')
     if not ws:
         logging.error("Expected WebSocket request.")
@@ -189,14 +190,12 @@ def stream():
     
     audio_generator = generate_stt_requests(ws)
     
-    # שליחת האודיו ל-Google STT וקבלת תמלול
-    # שימוש ב-try/except חיוני כאן
     try:
         stt_responses = GCP_SPEECH_CLIENT.streaming_recognize(STT_STREAMING_CONFIG, audio_generator)
     except Exception as e:
-        logging.error(f"FATAL: Google STT API connection failed. Check GCP Permissions! Error: {e}")
-        # Twilio ינתק את השיחה אם אין תגובה, או שתנתק כאן במפורש.
-        return "STT Error", 500
+        # שגיאה זו תתרחש אם האימות תקין, אך החיבור/הרשאה ל-API נכשלו בזמן הריצה.
+        logging.error(f"FATAL: Google STT API connection failed during runtime. Check network/permissions. Error: {e}")
+        return "STT Runtime Error", 500
 
     full_transcript = []
 
@@ -215,23 +214,11 @@ def stream():
                 if full_transcript:
                     final_user_input = " ".join(full_transcript)
                     
-                    # 1. עיבוד LLM (OpenAI)
                     llm_response_text = get_llm_response(final_user_input)
-                    
-                    # 2. המרת טקסט לדיבור (ElevenLabs / Twilio Say)
                     tts_result = synthesize_speech_url(llm_response_text)
                     
-                    # 3. יצירת Twilio Media Control Message להשמעת התשובה
                     twiml_response = VoiceResponse()
-                    
-                    # כרגע, אנחנו משתמשים ב-Twilio Say כ-fallback/placeholder
                     twiml_response.say(tts_result, language='he-IL') 
-                    
-                    # אם היה לנו URL אמיתי מ-CDN, היינו משתמשים בזה:
-                    # if tts_result.startswith('http'):
-                    #     twiml_response.play(tts_result)
-                    # else:
-                    #     twiml_response.say(tts_result, language='he-IL')
 
                     response_twiml_message = {
                         "event": "media_control",
@@ -241,7 +228,6 @@ def stream():
                     ws.send(json.dumps(response_twiml_message))
                     logging.info("Sent TwiML control message to Twilio.")
 
-                    # איפוס לשיחה הבאה
                     full_transcript = []
                     
     except Exception as e:
@@ -249,7 +235,6 @@ def stream():
         
     finally:
         logging.info("Closing WebSocket connection.")
-        # סגירת ה-WebSocket
         
 
 # --- 5. הפעלת השרת ---

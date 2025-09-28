@@ -4,6 +4,7 @@ import base64
 import time
 import logging
 import io 
+import traceback # ייבוא חדש ללכידת שגיאות מפורטת
 
 # אינטגרציה של Flask ו-WebSockets
 from flask import Flask, request, Response
@@ -51,6 +52,7 @@ except Exception as e:
     GCP_SPEECH_CLIENT = None 
 
 # -----------------------------------------------------------------------------
+# חשוב לוודא שהקידוד הוא MULAW וקצב הדגימה הוא 8000Hz - כפי ש-Twilio משדר.
 STT_STREAMING_CONFIG = speech.StreamingRecognitionConfig(
     config=speech.RecognitionConfig(
         encoding=speech.RecognitionConfig.AudioEncoding.MULAW,
@@ -138,39 +140,41 @@ def voice_webhook():
     response.say('שלום, אנא דברו לאחר הצליל.', language='he-IL') 
     
     ws_url = f'wss://{host}/stream'
-    response.append(Stream(url=ws_url))
+    # הוספת track=inbound כדי לוודא ששולחים רק את מה שהמשתמש אומר (פחות קריטי, אבל מומלץ)
+    response.append(Stream(url=ws_url, track='inbound')) 
     
-    logging.info(f"Voice Webhook initialized stream to: {ws_url}")
+    logging.info(f"Voice Webhook initialized stream to: {ws_url}. Session SID: {request.form.get('CallSid')}")
     return Response(str(response), mimetype='application/xml')
 
 # --- 4. לוגיקת WebSocket לתמלול ודיאלוג ---
 
 def generate_stt_requests(ws):
+    """ גנרטור שמקבל הודעות מ-WebSocket ומחזיר אודיו גולמי עבור Google STT."""
     while True:
         try:
-            # ה-Twilio Stream נשלח כ-JSON, שמכיל שדה 'media' עם נתוני האודיו
             message = ws.receive()
             if message is None:
-                # הלקוח סגר את החיבור
                 break
             
             data = json.loads(message)
             
             if data['event'] == 'start':
-                # **התיקון כאן:** מתעלם מאירוע ה'start' הראשוני של Twilio
-                logging.info(f"Twilio Stream started. Media Stream ID: {data.get('streamSid')}. Waiting for audio.")
+                logging.info(f"Twilio Stream started. Media Stream ID: {data.get('streamSid')}.")
                 continue
                 
             if data['event'] == 'media':
+                # Twilio שולח אודיו ב-Base64, שיש לפענח אותו חזרה לבתים (bytes)
                 audio_chunk = base64.b64decode(data['media']['payload'])
-                yield audio_chunk
-            
+                yield speech.StreamingRecognizeRequest(audio_content=audio_chunk) # שינוי: משגרים אובייקט בקשה של Google
+                
             elif data['event'] == 'stop':
                 logging.info("Twilio Stream stopped.")
                 break
                 
         except Exception as e:
-            logging.error(f"Error receiving audio from WebSocket: {e}")
+            # לכידת שגיאה בלולאת קבלת האודיו (למשל, JSON פגום)
+            logging.error(f"Error receiving/parsing audio from WebSocket: {e}")
+            logging.error(traceback.format_exc()) # הדפסת ה-traceback המלא
             break
 
 
@@ -183,7 +187,7 @@ def stream():
         logging.error("Expected WebSocket request.")
         return "Expected WebSocket", 400
 
-    logging.info("WebSocket connection established with Twilio.")
+    logging.info("WebSocket connection established with Twilio. Ready to process STT.")
     
     if not GCP_SPEECH_CLIENT:
         logging.error("GCP Speech Client failed to initialize. Closing stream immediately.")
@@ -195,8 +199,10 @@ def stream():
     
     try:
         # שימו לב: הקריאה ל-streaming_recognize היא חוסמת
+        # היא נכשלת מיידית אם יש בעיית אימות או תקשורת
         stt_responses = GCP_SPEECH_CLIENT.streaming_recognize(STT_STREAMING_CONFIG, audio_generator)
         
+        # לולאה זו לא תרוץ אם יש שגיאה ב-STT או בחיבור
         for response in stt_responses:
             if not response.results:
                 continue
@@ -235,7 +241,9 @@ def stream():
                     full_transcript = []
                     
     except Exception as e:
+        # כאן אנחנו מצפים לראות את השגיאה אם החיבור ל-Google STT נכשל!
         logging.error(f"General error in STT/LLM loop or streaming_recognize: {e}")
+        logging.error(traceback.format_exc()) # הדפסת ה-traceback המלא
         
     finally:
         # ודא שה-WebSocket נסגר בסוף
@@ -253,7 +261,6 @@ def stream():
 if __name__ == '__main__':
     logging.info("Starting Flask server with WebSocket handler...")
     # גורם ל-gunicorn להשתמש ב-gevent עם תמיכה ב-WebSocket
-    # *** תיקון שגיאת סינטקס: שימוש בצמד (host, port) כארגומנט ראשון ***
     host_port = ('0.0.0.0', int(os.environ.get('PORT', 5000)))
     http_server = WSGIServer(host_port, app, handler_class=WebSocketHandler)
     http_server.serve_forever()

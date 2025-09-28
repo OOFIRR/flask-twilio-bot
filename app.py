@@ -253,5 +253,6 @@ def stream():
 if __name__ == '__main__':
     logging.info("Starting Flask server with WebSocket handler...")
     # גורם ל-gunicorn להשתמש ב-gevent עם תמיכה ב-WebSocket
-    http_server = WSGIServer(('', int(os.environ.get('PORT', 5000)), app, handler_class=WebSocketHandler)
+    # *** תיקון שגיאת סינטקס: הוספת סוגר סוגר ')' ***
+    http_server = WSGIServer(('', int(os.environ.get('PORT', 5000)), app, handler_class=WebSocketHandler))
     http_server.serve_forever()

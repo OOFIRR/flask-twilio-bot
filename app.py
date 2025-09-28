@@ -29,26 +29,25 @@ openai.api_key = os.environ.get('OPENAI_API_KEY', 'YOUR_OPENAI_API_KEY')
 ELEVEN_API_KEY = os.environ.get('ELEVEN_API_KEY', 'YOUR_ELEVEN_API_KEY')
 VOICE_ID = os.environ.get('ELEVEN_VOICE_ID', 'EXa5x5N5kF7y5t2yJ90r') 
 
-# הגדרות Google STT - **העדכון מתבצע כאן!**
+# הגדרות Google STT
 # -----------------------------------------------------------------------------
+GCP_SPEECH_CLIENT = None
 try:
     # 1. קריאת מפתח השירות המלא (JSON) ממשתנה סביבה
     GCP_CREDENTIALS_JSON = os.environ.get('GCP_CREDENTIALS_JSON')
     if not GCP_CREDENTIALS_JSON:
-        raise ValueError("GCP_CREDENTIALS_JSON environment variable is not set.")
-
-    # 2. טעינת ה-JSON והכנת האובייקט Credentials
-    # משתמשים ב-json.loads כדי להמיר את המחרוזת לאובייקט
-    GCP_CREDENTIALS_INFO = json.loads(GCP_CREDENTIALS_JSON)
-    GCP_CREDENTIALS = service_account.Credentials.from_service_account_info(GCP_CREDENTIALS_INFO)
-    
-    # 3. יצירת הלקוח באמצעות ה-Credentials שנוצרו במפורש
-    GCP_SPEECH_CLIENT = speech.SpeechClient(credentials=GCP_CREDENTIALS)
-    logging.info("Google Speech Client initialized successfully using JSON credentials.")
+        logging.error("GCP_CREDENTIALS_JSON environment variable is not set. STT will fail.")
+    else:
+        # 2. טעינת ה-JSON והכנת האובייקט Credentials
+        GCP_CREDENTIALS_INFO = json.loads(GCP_CREDENTIALS_JSON)
+        GCP_CREDENTIALS = service_account.Credentials.from_service_account_info(GCP_CREDENTIALS_INFO)
+        
+        # 3. יצירת הלקוח באמצעות ה-Credentials שנוצרו במפורש
+        GCP_SPEECH_CLIENT = speech.SpeechClient(credentials=GCP_CREDENTIALS)
+        logging.info("Google Speech Client initialized successfully using JSON credentials.")
 
 except Exception as e:
-    logging.error(f"FATAL: Failed to initialize Google Speech Client. Check GCP_CREDENTIALS_JSON format and environment variable setup. Error: {e}")
-    # אם האימות נכשל בשלב הטעינה, ניתוק מהיר
+    logging.error(f"FATAL: Failed to initialize Google Speech Client during JSON parsing/initialization. Error: {e}")
     GCP_SPEECH_CLIENT = None 
 
 # -----------------------------------------------------------------------------
@@ -66,7 +65,6 @@ STT_STREAMING_CONFIG = speech.StreamingRecognitionConfig(
 # --- 2. פונקציות עזר לאינטגרציה ---
 
 def get_llm_response(prompt: str) -> str:
-# ... (הקוד נשאר זהה)
     logging.info(f"LLM Prompt: {prompt}")
     
     messages = [
@@ -89,13 +87,11 @@ def get_llm_response(prompt: str) -> str:
         return "אני מצטער, חלה שגיאה בשרת הדיאלוג."
 
 def upload_audio_to_cdn(audio_bytes: bytes) -> str:
-# ... (הקוד נשאר זהה)
     logging.warning("CDN Upload is not implemented. Returning placeholder URL for Twilio to use Say instead.")
     return "placeholder_url_for_say_fallback"
 
 
 def synthesize_speech_url(text: str) -> str:
-# ... (הקוד נשאר זהה)
     if not ELEVEN_API_KEY:
         logging.error("ElevenLabs API Key is missing. Falling back to Twilio Say.")
         return text 
@@ -134,12 +130,12 @@ def synthesize_speech_url(text: str) -> str:
 
 @app.route('/voice', methods=['POST'])
 def voice_webhook():
-# ... (הקוד נשאר זהה)
     host = request.headers.get('Host')
     
     response = VoiceResponse()
     
-    response.say('שלום, אנא דברו לאחר הצליל.', language='he-IL')
+    # שינוי קטן: מוסיף זמן קטן לשקט כדי לאפשר ל-Twilio להתחבר
+    response.say('שלום, אנא דברו לאחר הצליל.', language='he-IL') 
     
     ws_url = f'wss://{host}/stream'
     response.append(Stream(url=ws_url))
@@ -150,15 +146,21 @@ def voice_webhook():
 # --- 4. לוגיקת WebSocket לתמלול ודיאלוג ---
 
 def generate_stt_requests(ws):
-# ... (הקוד נשאר זהה)
     while True:
         try:
+            # ה-Twilio Stream נשלח כ-JSON, שמכיל שדה 'media' עם נתוני האודיו
             message = ws.receive()
             if message is None:
+                # הלקוח סגר את החיבור
                 break
             
             data = json.loads(message)
             
+            if data['event'] == 'start':
+                # **התיקון כאן:** מתעלם מאירוע ה'start' הראשוני של Twilio
+                logging.info(f"Twilio Stream started. Media Stream ID: {data.get('streamSid')}. Waiting for audio.")
+                continue
+                
             if data['event'] == 'media':
                 audio_chunk = base64.b64decode(data['media']['payload'])
                 yield audio_chunk
@@ -176,11 +178,6 @@ def generate_stt_requests(ws):
 def stream():
     """נקודת קצה ל-WebSocket שמטפלת בזרם האודיו."""
     
-    # בדיקת אתחול לקוח Google Speech
-    if not GCP_SPEECH_CLIENT:
-        logging.error("GCP Speech Client failed to initialize. Cannot process stream.")
-        return "GCP Init Error", 500
-        
     ws = request.environ.get('wsgi.websocket')
     if not ws:
         logging.error("Expected WebSocket request.")
@@ -188,24 +185,25 @@ def stream():
 
     logging.info("WebSocket connection established with Twilio.")
     
+    if not GCP_SPEECH_CLIENT:
+        logging.error("GCP Speech Client failed to initialize. Closing stream immediately.")
+        ws.close()
+        return "GCP Init Error", 500
+        
     audio_generator = generate_stt_requests(ws)
+    full_transcript = []
     
     try:
+        # שימו לב: הקריאה ל-streaming_recognize היא חוסמת
         stt_responses = GCP_SPEECH_CLIENT.streaming_recognize(STT_STREAMING_CONFIG, audio_generator)
-    except Exception as e:
-        # שגיאה זו תתרחש אם האימות תקין, אך החיבור/הרשאה ל-API נכשלו בזמן הריצה.
-        logging.error(f"FATAL: Google STT API connection failed during runtime. Check network/permissions. Error: {e}")
-        return "STT Runtime Error", 500
-
-    full_transcript = []
-
-    try:
+        
         for response in stt_responses:
             if not response.results:
                 continue
 
             result = response.results[0]
             
+            # בדיקת תוצאה סופית (לא תוצאת ביניים)
             if result.is_final:
                 transcript = result.alternatives[0].transcript
                 full_transcript.append(transcript)
@@ -214,10 +212,15 @@ def stream():
                 if full_transcript:
                     final_user_input = " ".join(full_transcript)
                     
+                    # 1. עיבוד LLM (OpenAI)
                     llm_response_text = get_llm_response(final_user_input)
+                    
+                    # 2. המרת טקסט לדיבור (ElevenLabs) וקבלת טקסט חזרה (בגלל מגבלות CDN)
                     tts_result = synthesize_speech_url(llm_response_text)
                     
+                    # 3. יצירת Twilio Media Control Message להשמעת התשובה
                     twiml_response = VoiceResponse()
+                    # משתמשים ב-Twilio Say, כאשר tts_result הוא הטקסט שה-AI יצר (כי ה-CDN לא עובד)
                     twiml_response.say(tts_result, language='he-IL') 
 
                     response_twiml_message = {
@@ -228,18 +231,27 @@ def stream():
                     ws.send(json.dumps(response_twiml_message))
                     logging.info("Sent TwiML control message to Twilio.")
 
+                    # איפוס לשיחה הבאה (חשוב מאוד להמשך הדיאלוג)
                     full_transcript = []
                     
     except Exception as e:
-        logging.error(f"General error in STT/LLM loop: {e}")
+        logging.error(f"General error in STT/LLM loop or streaming_recognize: {e}")
         
     finally:
+        # ודא שה-WebSocket נסגר בסוף
         logging.info("Closing WebSocket connection.")
-        
+        try:
+            ws.close()
+        except Exception as close_err:
+            logging.error(f"Error closing WebSocket: {close_err}")
+            
+    # הפונקציה צריכה להחזיר משהו, גם אם זה לאחר סגירת החיבור
+    return "Stream closed", 200
 
 # --- 5. הפעלת השרת ---
 
 if __name__ == '__main__':
     logging.info("Starting Flask server with WebSocket handler...")
-    http_server = WSGIServer(('', int(os.environ.get('PORT', 5000))), app, handler_class=WebSocketHandler)
+    # גורם ל-gunicorn להשתמש ב-gevent עם תמיכה ב-WebSocket
+    http_server = WSGIServer(('', int(os.environ.get('PORT', 5000)), app, handler_class=WebSocketHandler)
     http_server.serve_forever()

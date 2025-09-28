@@ -10,13 +10,11 @@ import traceback
 from flask import Flask, request, Response
 from gevent.pywsgi import WSGIServer
 from geventwebsocket.handler import WebSocketHandler
-from twilio.twiml.voice_response import VoiceResponse, Stream, Say, Play, Start # ייבוא Start
-# שינוי: ייבוא Stop כדי לסיים את ה-Stream אחרי תגובה
+from twilio.twiml.voice_response import VoiceResponse, Stream, Say, Play, Start
 from twilio.twiml.voice_response import Stop 
 
 # אינטגרציה של Google Cloud Speech-to-Text
 from google.cloud import speech_v1p1beta1 as speech
-# לייבוא פונקציית האימות המפורשת של Google
 from google.oauth2 import service_account 
 from google.api_core import exceptions as gcp_exceptions 
 
@@ -55,15 +53,14 @@ except Exception as e:
     GCP_SPEECH_CLIENT = None 
 
 # -----------------------------------------------------------------------------
-# עדכון: מודל ל-phone_call ו-interim_results=True (כדי לקבל תגובה מהירה)
 STT_STREAMING_CONFIG = speech.StreamingRecognitionConfig(
     config=speech.RecognitionConfig(
         encoding=speech.RecognitionConfig.AudioEncoding.MULAW,
         sample_rate_hertz=8000,
         language_code='he-IL',
-        model='phone_call', # שינוי: שימוש במודל לשיחות טלפון
+        model='phone_call',
     ),
-    interim_results=True, # שינוי: הפעלת תוצאות ביניים
+    interim_results=True,
     single_utterance=False,
 )
 
@@ -92,6 +89,7 @@ def get_llm_response(prompt: str) -> str:
         return "אני מצטער, חלה שגיאה בשרת הדיאלוג."
 
 def upload_audio_to_cdn(audio_bytes: bytes) -> str:
+    # הערה: יש צורך להטמיע העלאה ל-S3/CDN אמיתי כדי להשתמש ב-<Play>
     logging.warning("CDN Upload is not implemented. Returning placeholder URL for Twilio to use Say instead.")
     return "placeholder_url_for_say_fallback"
 
@@ -124,6 +122,7 @@ def synthesize_speech_url(text: str) -> str:
         
         audio_bytes = resp.content
         
+        # כרגע, אנחנו לא יכולים להשתמש באודיו הזה ישירות בלי CDN
         logging.warning("ElevenLabs successful, but returning text for Twilio Say (CDN not implemented).")
         return text 
 
@@ -142,13 +141,12 @@ def voice_webhook():
     response.say('שלום, אנא דברו לאחר הצליל.', language='he-IL') 
     
     # ** תיקון קריטי: עטיפת Stream בתוך Start **
+    # הערה: כדי להמשיך את השיחה אחרי סיום ה-Stream, נדרש להוסיף action ל-Start
+    # לדוגמה: with response.start(action=f'https://{host}/respond_after_stream') as start:
     with response.start() as start:
         ws_url = f'wss://{host}/stream'
         start.stream(url=ws_url, track='inbound')
         
-    # Twilio יחכה 5 שניות לתחילת ה-WebSocket לפני שהוא מנתק או עובר הלאה
-    # אין צורך ב-Stop מפורש, Twilio תעבור ל-WebSocket אוטומטית.
-
     logging.info(f"Voice Webhook initialized stream to: {ws_url}. Session SID: {request.form.get('CallSid')}")
     return Response(str(response), mimetype='application/xml')
 
@@ -194,10 +192,17 @@ def generate_stt_requests(ws):
 def stream():
     """נקודת קצה ל-WebSocket שמטפלת בזרם האודיו."""
     
+    logging.info("STREAM INIT: /stream endpoint hit.") 
+    
     ws = request.environ.get('wsgi.websocket')
+    
     if not ws:
-        logging.error("STREAM: Expected WebSocket request.")
-        return "Expected WebSocket", 400
+        logging.error("STREAM ERROR: wsgi.websocket not found. Check server configuration (Gunicorn/Gevent).")
+        for key, value in request.environ.items():
+            if 'websocket' in key.lower() or 'upgrade' in key.lower():
+                 logging.error(f"STREAM DEBUG: Found relevant environ key: {key} = {value}")
+        
+        return "WebSocket Setup Failed", 400
 
     logging.info("STREAM: WebSocket connection established with Twilio. Ready to process STT.")
     
@@ -207,14 +212,16 @@ def stream():
         return "GCP Init Error", 500
         
     audio_generator = generate_stt_requests(ws)
-    
-    # משתנים מקומיים לכל סשן WebSocket
     full_transcript = []
     
     try:
-        stt_responses = GCP_SPEECH_CLIENT.streaming_recognize(audio_generator, timeout=300)
+        # ** תיקון קריטי: שינוי חתימת הקריאה ל-Google STT **
+        stt_responses = GCP_SPEECH_CLIENT.streaming_recognize(
+            config=STT_STREAMING_CONFIG,
+            requests=audio_generator, # תיקון: מעביר את הגנרטור כ-requests
+            timeout=300
+        )
         
-        # לולאה זו מקבלת תגובות מ-Google
         for response in stt_responses:
             if not response.results:
                 continue
@@ -223,47 +230,35 @@ def stream():
             transcript = result.alternatives[0].transcript
             
             if result.is_final:
-                # הגיעה תוצאה סופית
                 full_transcript.append(transcript)
                 logging.info(f"TRANSCRIPT: FINAL: {transcript}")
                 
-                # אם יש תוצאה סופית, מגיבים
                 if full_transcript:
                     final_user_input = " ".join(full_transcript)
                     
                     # 1. עיבוד LLM (OpenAI)
                     llm_response_text = get_llm_response(final_user_input)
                     
-                    # 2. המרת טקסט לדיבור ושימוש ב-Say
+                    # 2. המרת טקסט לדיבור
+                    # (כרגע רק מחזיר את הטקסט, ללא ElevenLabs/CDN)
                     tts_result = synthesize_speech_url(llm_response_text)
                     
-                    # 3. יצירת Twilio Media Control Message להשמעת התשובה
-                    # הערה: Twilio לא תעבד TwiML של Say/Play ישירות ב-media_control
-                    # אבל נשאיר את זה עד שנחליט על לוגיקת Webhook חדשה
-                    twiml_response = VoiceResponse()
-                    twiml_response.say(tts_result, language='he-IL') 
+                    # 3. סגירת ה-WebSocket כדי לאפשר ל-Twilio להגיב
+                    # Twilio לא מפרש TwiML דרך media_control.
+                    # כרגע, אנחנו פשוט סוגרים את השיחה לאחר קבלת התשובה.
                     
-                    # כרגע, נשלח את הפקודה לסיים את ה-Stream כדי ש-Twilio תוכל להמשיך
-                    # ההודעה הזו לא בהכרח תגרום להשמעה, אבל היא מנקה את ה-Stream
-                    response_twiml_message = {
-                        "event": "media_control",
-                        "text": str(twiml_response) # Twilio תתעלם מכך ברוב המקרים
-                    }
+                    logging.warning(f"CONTROL: Closing WebSocket to signal end of turn. Response text: {tts_result}")
                     
-                    # אם נרצה לסיים את השיחה אחרי תגובה אחת (ללא לולאת דיאלוג מורכבת):
-                    # ws.close() 
-                    # return "Stream closed after response", 200
+                    # ניתן לשלוח הודעת stop מפורשת ל-Twilio לפני סגירה:
+                    # ws.send(json.dumps({"event": "stop"})) 
+                    
+                    # סגירת החיבור תנתק את השיחה עד שנוסיף לוגיקת action Webhook מורכבת
+                    ws.close()
+                    return "Stream closed after LLM response", 200
 
-                    ws.send(json.dumps(response_twiml_message))
-                    logging.info("CONTROL: Sent TwiML control message (using Say fallback).")
-
-                    # ** חשוב מאוד: איפוס ה-transcript לאחר שליחת תגובה **
-                    full_transcript = []
             else:
-                 # תוצאות ביניים
                 logging.debug(f"TRANSCRIPT: INTERIM: {transcript}")
                     
-    # טיפול ספציפי בשגיאות GCP
     except gcp_exceptions.GoogleAPICallError as e:
         logging.error(f"STREAM ERROR: Google API Call Error (gRPC failure). Details: {e.details}")
         logging.error(traceback.format_exc())
@@ -272,13 +267,14 @@ def stream():
         logging.error(traceback.format_exc()) 
         
     finally:
-        logging.info("STREAM: Closing WebSocket connection.")
+        logging.info("STREAM: Ensuring WebSocket connection is closed.")
         try:
+            # אם החיבור נסגר כבר למעלה, זה לא יקרה שוב
             ws.close()
         except Exception as close_err:
             logging.error(f"STREAM: Error closing WebSocket: {close_err}")
             
-    return "Stream closed", 200
+    return "Stream handling finished", 200
 
 # --- 5. הפעלת השרת ---
 

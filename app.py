@@ -231,13 +231,3 @@ def stream():
     return "Stream handling finished", 200
 
 # --- 5. הפעלת השרת באמצעות Gevent (עקיפת Gunicorn) ---
-
-if __name__ == '__main__':
-    logging.info(f"Starting Gevent WSGI server on port {PORT}")
-    try:
-        # הפעלת שרת WSGI של Gevent שתומך ב-WebSocket
-        # (WebSocketHandler הוא הקריטי לתמיכה בנקודת הקצה /stream)
-        http_server = WSGIServer(('', PORT), app, handler_class=WebSocketHandler)
-        http_server.serve_forever()
-    except Exception as e:
-        logging.critical(f"FATAL: Gevent server failed to start. Error: {e}")

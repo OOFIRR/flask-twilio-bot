@@ -10,8 +10,7 @@ COPY . /app
 
 RUN pip install --no-cache-dir -r requirements.txt
 
-# הפוך את הסקריפט ל-executable
+# ודא ש-start.sh קיים ובעל הרשאות הרצה
 RUN chmod +x /app/start.sh
 
-# השתמש בסקריפט כ-entrypoint
 ENTRYPOINT ["/app/start.sh"]

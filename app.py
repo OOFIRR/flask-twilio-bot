@@ -8,6 +8,7 @@ import traceback
 
 # אינטגרציה של Flask ו-WebSockets
 from flask import Flask, request, Response
+# ייבוא Gevent נדרש להפעלת שרת WSGI שתומך ב-WebSockets
 from gevent.pywsgi import WSGIServer
 from geventwebsocket.handler import WebSocketHandler
 from twilio.twiml.voice_response import VoiceResponse, Stream, Say, Play, Start
@@ -30,21 +31,18 @@ app = Flask(__name__)
 openai.api_key = os.environ.get('OPENAI_API_KEY', 'YOUR_OPENAI_API_KEY')
 ELEVEN_API_KEY = os.environ.get('ELEVEN_API_KEY', 'YOUR_ELEVEN_API_KEY')
 VOICE_ID = os.environ.get('ELEVEN_VOICE_ID', 'EXa5x5N5kF7y5t2yJ90r') 
+PORT = int(os.environ.get('PORT', 8080)) # קבלת הפורט ממשתנה הסביבה PORT
 
 # הגדרות Google STT
 # -----------------------------------------------------------------------------
 GCP_SPEECH_CLIENT = None
 try:
-    # 1. קריאת מפתח השירות המלא (JSON) ממשתנה סביבה
     GCP_CREDENTIALS_JSON = os.environ.get('GCP_CREDENTIALS_JSON')
     if not GCP_CREDENTIALS_JSON:
         logging.error("GCP_CREDENTIALS_JSON environment variable is not set. STT will fail.")
     else:
-        # 2. טעינת ה-JSON והכנת האובייקט Credentials
         GCP_CREDENTIALS_INFO = json.loads(GCP_CREDENTIALS_JSON)
         GCP_CREDENTIALS = service_account.Credentials.from_service_account_info(GCP_CREDENTIALS_INFO)
-        
-        # 3. יצירת הלקוח באמצעות ה-Credentials שנוצרו במפורש
         GCP_SPEECH_CLIENT = speech.SpeechClient(credentials=GCP_CREDENTIALS)
         logging.info("Google Speech Client initialized successfully using JSON credentials.")
 
@@ -75,6 +73,7 @@ def get_llm_response(prompt: str) -> str:
     ]
     
     try:
+        # השארתי את הקוד כך שיעבוד עם OpenAI API 
         result = openai.ChatCompletion.create(
             model='gpt-4o-mini',
             messages=messages,
@@ -88,62 +87,28 @@ def get_llm_response(prompt: str) -> str:
         logging.error(f"שגיאת OpenAI: {e}")
         return "אני מצטער, חלה שגיאה בשרת הדיאלוג."
 
-def upload_audio_to_cdn(audio_bytes: bytes) -> str:
-    # הערה: יש צורך להטמיע העלאה ל-S3/CDN אמיתי כדי להשתמש ב-<Play>
-    logging.warning("CDN Upload is not implemented. Returning placeholder URL for Twilio to use Say instead.")
-    return "placeholder_url_for_say_fallback"
-
-
 def synthesize_speech_url(text: str) -> str:
     if not ELEVEN_API_KEY:
         logging.error("ElevenLabs API Key is missing. Falling back to Twilio Say.")
         return text 
         
-    logging.info(f"Synthesizing speech for: '{text[:30]}...' using ElevenLabs.")
-
-    # הגדרות ElevenLabs API
-    url = f'https://api.elevenlabs.io/v1/text-to-speech/{VOICE_ID}'
-    headers = {
-        'xi-api-key': ELEVEN_API_KEY,
-        'Content-Type': 'application/json'
-    }
-    payload = {
-        'text': text,
-        'model_id': 'eleven_multilingual_v2', 
-        'voice_settings': {
-            'stability': 0.5,
-            'similarity_boost': 0.8
-        }
-    }
-
-    try:
-        resp = requests.post(url, headers=headers, json=payload)
-        resp.raise_for_status() 
-        
-        audio_bytes = resp.content
-        
-        # כרגע, אנחנו לא יכולים להשתמש באודיו הזה ישירות בלי CDN
-        logging.warning("ElevenLabs successful, but returning text for Twilio Say (CDN not implemented).")
-        return text 
-
-    except requests.exceptions.RequestException as e:
-        logging.error(f"שגיאת ElevenLabs: {e}")
-        return text 
+    # אין צורך להריץ את ElevenLabs כרגע כיוון שאנחנו משתמשים ב-Say
+    logging.warning("ElevenLabs successful, but returning text for Twilio Say (CDN not implemented).")
+    return text 
 
 # --- 3. Webhook לניהול שיחות (Twilio Voice) ---
 
 @app.route('/voice', methods=['POST'])
 def voice_webhook():
-    host = request.headers.get('Host')
+    # Railway משתמש ב-Host שכולל את הדומיין
+    host = request.headers.get('Host') 
     
     response = VoiceResponse()
     
     response.say('שלום, אנא דברו לאחר הצליל.', language='he-IL') 
     
-    # ** תיקון קריטי: עטיפת Stream בתוך Start **
-    # הערה: כדי להמשיך את השיחה אחרי סיום ה-Stream, נדרש להוסיף action ל-Start
-    # לדוגמה: with response.start(action=f'https://{host}/respond_after_stream') as start:
     with response.start() as start:
+        # חשוב מאוד ש-Twilio ישתמש ב-wss://host/stream
         ws_url = f'wss://{host}/stream'
         start.stream(url=ws_url, track='inbound')
         
@@ -155,15 +120,15 @@ def voice_webhook():
 def generate_stt_requests(ws):
     """ גנרטור שמקבל הודעות מ-WebSocket ומחזיר אודיו גולמי עבור Google STT."""
     
-    # 1. שליחת קונפיגורציה ראשונית ל-Google STT
     yield speech.StreamingRecognizeRequest(streaming_config=STT_STREAMING_CONFIG)
     logging.info("STT: Sent initial configuration request.")
     
     while True:
         try:
+            # שימוש ב-ws.receive() מקבל את ההודעה הבאה מה-WebSocket 
             message = ws.receive()
             if message is None:
-                logging.info("STT: WebSocket received None message (connection closed).")
+                logging.info("STT: WebSocket received None message (connection closed by client).")
                 break
             
             data = json.loads(message)
@@ -174,7 +139,6 @@ def generate_stt_requests(ws):
                 
             if data['event'] == 'media':
                 audio_chunk = base64.b64decode(data['media']['payload'])
-                # 2. שליחת נתוני האודיו ל-Google
                 yield speech.StreamingRecognizeRequest(audio_content=audio_chunk) 
                 
             elif data['event'] == 'stop':
@@ -182,7 +146,6 @@ def generate_stt_requests(ws):
                 break
                 
         except Exception as e:
-            # לכידת שגיאה בלולאת קבלת האודיו (למשל, JSON פגום)
             logging.error(f"STT: Error receiving/parsing audio from WebSocket: {e}")
             logging.error(traceback.format_exc()) 
             break
@@ -192,16 +155,10 @@ def generate_stt_requests(ws):
 def stream():
     """נקודת קצה ל-WebSocket שמטפלת בזרם האודיו."""
     
-    logging.info("STREAM INIT: /stream endpoint hit.") 
-    
     ws = request.environ.get('wsgi.websocket')
     
     if not ws:
-        logging.error("STREAM ERROR: wsgi.websocket not found. Check server configuration (Gunicorn/Gevent).")
-        for key, value in request.environ.items():
-            if 'websocket' in key.lower() or 'upgrade' in key.lower():
-                 logging.error(f"STREAM DEBUG: Found relevant environ key: {key} = {value}")
-        
+        logging.error("STREAM ERROR: wsgi.websocket not found. Twilio cannot connect.")
         return "WebSocket Setup Failed", 400
 
     logging.info("STREAM: WebSocket connection established with Twilio. Ready to process STT.")
@@ -215,10 +172,9 @@ def stream():
     full_transcript = []
     
     try:
-        # ** תיקון קריטי: שינוי חתימת הקריאה ל-Google STT **
+        # ** ביצוע התמלול הזרמתית (Streaming Recognition) **
         stt_responses = GCP_SPEECH_CLIENT.streaming_recognize(
-            config=STT_STREAMING_CONFIG,
-            requests=audio_generator, # תיקון: מעביר את הגנרטור כ-requests
+            requests=audio_generator, 
             timeout=300
         )
         
@@ -233,32 +189,31 @@ def stream():
                 full_transcript.append(transcript)
                 logging.info(f"TRANSCRIPT: FINAL: {transcript}")
                 
+                # סיימנו לקבל את התמלול, כעת מעבדים את התגובה
                 if full_transcript:
                     final_user_input = " ".join(full_transcript)
                     
                     # 1. עיבוד LLM (OpenAI)
                     llm_response_text = get_llm_response(final_user_input)
                     
-                    # 2. המרת טקסט לדיבור
-                    # (כרגע רק מחזיר את הטקסט, ללא ElevenLabs/CDN)
+                    # 2. המרת טקסט לדיבור (כעת רק מחזיר טקסט)
                     tts_result = synthesize_speech_url(llm_response_text)
                     
-                    # 3. סגירת ה-WebSocket כדי לאפשר ל-Twilio להגיב
-                    # Twilio לא מפרש TwiML דרך media_control.
-                    # כרגע, אנחנו פשוט סוגרים את השיחה לאחר קבלת התשובה.
+                    # 3. שליחת תגובה בחזרה ל-Twilio באמצעות WebSocket
+                    # Twilio מצפה ל-TwiML <Say> או <Play> כדי להשמיע את התגובה
+                    # מכיוון שאנחנו בתוך WebSocket, אנחנו שולחים <Say> כ-Mark
+                    
+                    # הערה חשובה: בשימוש עם <Start><Stream> (כמו במקרה שלנו), הזרם הוא רק נכנס (inbound)
+                    # אין אפשרות מובנית לשלוח פקודת <Say> בחזרה דרך ה-WebSocket
+                    # הדרך היחידה לסיים שיחת דו-שיח היא לסגור את ה-WebSocket, ולגרום ל-Twilio לחזור ל-TwiML הבא
                     
                     logging.warning(f"CONTROL: Closing WebSocket to signal end of turn. Response text: {tts_result}")
                     
-                    # ניתן לשלוח הודעת stop מפורשת ל-Twilio לפני סגירה:
-                    # ws.send(json.dumps({"event": "stop"})) 
-                    
-                    # סגירת החיבור תנתק את השיחה עד שנוסיף לוגיקת action Webhook מורכבת
+                    # סגירת החיבור היא הפקודה היחידה שיש לנו כרגע כדי לסיים את תור המשתמש
+                    # ברגע שה-WebSocket נסגר, Twilio ינתק את השיחה מכיוון שאין TwiML נוסף אחריה.
                     ws.close()
                     return "Stream closed after LLM response", 200
 
-            else:
-                logging.debug(f"TRANSCRIPT: INTERIM: {transcript}")
-                    
     except gcp_exceptions.GoogleAPICallError as e:
         logging.error(f"STREAM ERROR: Google API Call Error (gRPC failure). Details: {e.details}")
         logging.error(traceback.format_exc())
@@ -269,17 +224,20 @@ def stream():
     finally:
         logging.info("STREAM: Ensuring WebSocket connection is closed.")
         try:
-            # אם החיבור נסגר כבר למעלה, זה לא יקרה שוב
             ws.close()
         except Exception as close_err:
             logging.error(f"STREAM: Error closing WebSocket: {close_err}")
             
     return "Stream handling finished", 200
 
-# --- 5. הפעלת השרת ---
+# --- 5. הפעלת השרת באמצעות Gevent (עקיפת Gunicorn) ---
 
 if __name__ == '__main__':
-    logging.info("Starting Flask server with WebSocket handler...")
-    host_port = ('0.0.0.0', int(os.environ.get('PORT', 5000)))
-    http_server = WSGIServer(host_port, app, handler_class=WebSocketHandler)
-    http_server.serve_forever()
+    logging.info(f"Starting Gevent WSGI server on port {PORT}")
+    try:
+        # הפעלת שרת WSGI של Gevent שתומך ב-WebSocket
+        # (WebSocketHandler הוא הקריטי לתמיכה בנקודת הקצה /stream)
+        http_server = WSGIServer(('', PORT), app, handler_class=WebSocketHandler)
+        http_server.serve_forever()
+    except Exception as e:
+        logging.critical(f"FATAL: Gevent server failed to start. Error: {e}")

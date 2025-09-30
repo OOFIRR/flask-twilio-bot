@@ -1,9 +1,10 @@
 #!/bin/bash
+# Ensures the script exits if any command fails.
+set -e
 
-# Log the port Railway is assigning for debugging
+# Log the port for debugging and use double quotes for variable expansion.
 echo "INFO: Attempting to bind to 0.0.0.0:$PORT"
 
-# Run the Gunicorn server
-# --bind 0.0.0.0:$PORT is crucial for Railway deployments.
-# It tells Gunicorn to listen on the port specified by the $PORT environment variable.
-gunicorn --worker-class geventwebsocket.gunicorn.workers.GeventWebSocketWorker --bind 0.0.0.0:$PORT app:app
+# The --bind flag correctly uses the $PORT variable from the environment.
+# This is required for deployments on Railway.
+gunicorn --worker-class geventwebsocket.gunicorn.workers.GeventWebSocketWorker --bind "0.0.0.0:$PORT" app:app

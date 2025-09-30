@@ -1,4 +1,3 @@
-Use the official Python image with the slim tag for a smaller image size
 FROM python:3.10-slim
 
 Install system dependencies needed for ffpme (used in the original setup)

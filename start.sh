@@ -1,1 +1,2 @@
-Immersive content redacted for brevity.
+#!/bin/sh
+exec gunicorn --worker-class geventwebsocket.gunicorn.workers.GeventWebSocketWorker --bind 0.0.0.0:8080 app:app

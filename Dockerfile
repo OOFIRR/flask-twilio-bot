@@ -10,8 +10,6 @@ COPY . /app
 
 RUN pip install --no-cache-dir -r requirements.txt
 
-# הפוך את start.sh לאקזקיוטבילי
 RUN chmod +x /app/start.sh
 
-# זה קריטי: הפוך אותו ל-entrypoint
 ENTRYPOINT ["/app/start.sh"]

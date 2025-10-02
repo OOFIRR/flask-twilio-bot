@@ -112,13 +112,14 @@ def voice_webhook():
     """Handles incoming calls from Twilio and connects them to the websocket."""
     response = VoiceResponse()
     connect = Connect()
-    # CRITICAL FIX: Removed the invalid 'voice' attribute.
-    # We now only specify the language, letting Twilio use its default, high-quality Hebrew voice.
-    response.say("שלום, אני מאזין.", language="he-IL")
+    # CRITICAL FIX: The <Say> verb is completely removed.
+    # It caused a fatal warning because Twilio does not support he-IL for Text-to-Speech.
+    # The bot will now rely exclusively on ElevenLabs for all speech.
     connect.stream(url=TWILIO_WEBSOCKET_URL)
     response.append(connect)
-    response.pause(length=120)
-    logger.info("Generated TwiML for incoming call.")
+    # The pause is kept to ensure the call stays active while the websocket connects and works.
+    response.pause(length=120) 
+    logger.info("Generated TwiML for incoming call (without <Say>).")
     return str(response), 200, {'Content-Type': 'application/xml'}
 
 @app.route('/stream')

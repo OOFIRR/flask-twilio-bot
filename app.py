@@ -3,6 +3,7 @@ import json
 import base64
 import logging
 from flask import Flask, request
+from flask_talisman import Talisman
 from twilio.twiml.voice_response import VoiceResponse, Connect
 from google.cloud import speech
 from elevenlabs.client import ElevenLabs
@@ -26,6 +27,8 @@ LANGUAGE_CODE = "he-IL"
 
 # --- App ---
 app = Flask(__name__)
+Talisman(app, content_security_policy=None)
+
 
 # --- Google Credentials ---
 def load_gcp_credentials():

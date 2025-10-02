@@ -78,7 +78,8 @@ def get_bot_response(text):
 def voice():
     response = VoiceResponse()
     connect = Connect()
-    connect.stream(url=f"wss://{request.host}/stream")
+    # 👇 כתובת קבועה – חובה!
+    connect.stream(url="wss://web-production-770fa.up.railway.app/stream")
     response.append(connect)
     logger.info("TwiML generated. Connecting to WebSocket.")
     return str(response), 200, {"Content-Type": "application/xml"}

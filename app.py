@@ -14,8 +14,30 @@ from elevenlabs.client import AsyncElevenLabs
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# --- GCP Credentials Setup (CRITICAL FOR RAILWAY) ---
+# This block reads the JSON credentials from an environment variable,
+# writes them to a temporary file, and points the Google Cloud library to that file.
+GCP_CREDS_JSON_STR = os.environ.get("GCP_CREDENTIALS_JSON")
+speech_client = None
+if GCP_CREDS_JSON_STR:
+    try:
+        # Create a temporary file to store the credentials
+        with open("/tmp/gcp_creds.json", "w") as f:
+            f.write(GCP_CREDS_JSON_STR)
+        # Set the environment variable that the Google Cloud library expects
+        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "/tmp/gcp_creds.json"
+        
+        # Initialize the client AFTER setting the environment variable
+        speech_client = speech.SpeechClient()
+        logger.info("GCP credentials loaded and Speech Client initialized successfully.")
+    except Exception as e:
+        logger.error(f"Failed to load GCP credentials or initialize Speech Client: {e}")
+else:
+    logger.error("GCP_CREDENTIALS_JSON environment variable not found. Speech-to-Text will not work.")
+# --- End of Credentials Setup ---
+
+
 # --- Environment Variables & Constants ---
-# Ensure you have set these in your Railway environment variables
 TWILIO_DOMAIN = os.environ.get("RAILWAY_STATIC_URL")
 if not TWILIO_DOMAIN:
     raise ValueError("RAILWAY_STATIC_URL environment variable not set.")
@@ -24,14 +46,12 @@ VOICE_STREAM_URL = f"wss://{TWILIO_DOMAIN}/stream"
 ELEVENLABS_API_KEY = os.environ.get("ELEVENLABS_API_KEY")
 ELEVENLABS_VOICE_ID = os.environ.get("ELEVENLABS_VOICE_ID")
 if not ELEVENLABS_API_KEY or not ELEVENLABS_VOICE_ID:
-    raise ValueError("ELEVEN_API_KEY and ELEVEN_VOICE_ID environment variables must be set.")
-# Use the async client for our async handler
+    raise ValueError("ELEVENLABS_API_KEY and ELEVENLABS_VOICE_ID environment variables must be set.")
 elevenlabs_client = AsyncElevenLabs(api_key=ELEVENLABS_API_KEY)
 
 # Google Cloud Speech-to-Text configuration
 SAMPLE_RATE = 8000
 LANGUAGE_CODE = 'he-IL'
-speech_client = speech.SpeechClient()
 recognition_config = speech.RecognitionConfig(
     encoding=speech.RecognitionConfig.AudioEncoding.MULAW,
     sample_rate_hertz=SAMPLE_RATE,
@@ -50,7 +70,6 @@ app = Flask(__name__)
 
 # --- Core Bot Logic ---
 def handle_text_response(text: str) -> str:
-    """Generates a response based on user input."""
     logger.info(f"User said: '{text}'")
     text_lower = text.lower().strip()
     if "שלום" in text_lower or "היי" in text_lower:
@@ -61,7 +80,6 @@ def handle_text_response(text: str) -> str:
         return "לא כל כך הבנתי. אפשר לנסות שוב בבקשה?"
 
 async def send_audio_response_to_twilio(ws, stream_sid: str, text_to_speak: str):
-    """Generates audio with ElevenLabs and streams it back to Twilio."""
     logger.info(f"Generating audio for: '{text_to_speak}'")
     try:
         audio_stream = await elevenlabs_client.generate(
@@ -71,7 +89,6 @@ async def send_audio_response_to_twilio(ws, stream_sid: str, text_to_speak: str)
             stream=True,
             output_format="mulaw_8000"
         )
-
         async for audio_chunk in audio_stream:
             if audio_chunk:
                 payload = base64.b64encode(audio_chunk).decode("utf-8")
@@ -81,7 +98,6 @@ async def send_audio_response_to_twilio(ws, stream_sid: str, text_to_speak: str)
                     "media": {"payload": payload}
                 }
                 await ws.send(json.dumps(media_message))
-
         mark_message = {
             "event": "mark",
             "streamSid": stream_sid,
@@ -94,6 +110,10 @@ async def send_audio_response_to_twilio(ws, stream_sid: str, text_to_speak: str)
 
 # --- WebSocket Handler ---
 async def twilio_stream_handler(ws):
+    if not speech_client:
+        logger.error("Speech client is not initialized. Cannot handle WebSocket stream.")
+        return
+
     logger.info("WebSocket connection established.")
     stream_sid = None
 
@@ -120,7 +140,6 @@ async def twilio_stream_handler(ws):
     try:
         requests = audio_generator_from_twilio(ws)
         responses = speech_client.streaming_recognize(requests=requests)
-
         for response in responses:
             if not response.results or not response.results[0].alternatives:
                 continue

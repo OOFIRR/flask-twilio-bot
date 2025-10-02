@@ -280,3 +280,17 @@ if __name__ == '__main__':
     # שימוש ב-WSGIServer של Gevent עם WebSocketHandler
     http_server = WSGIServer(('0.0.0.0', int(PORT)), app, handler_class=WebSocketHandler)
     http_server.serve_forever()
+
+# ... (Your existing Flask app code) ...
+# --- Add the following code to the VERY END of your app.py file ---
+
+import os
+
+if __name__ == "__main__":
+    # Read the PORT environment variable provided by Railway
+    port = int(os.environ.get("PORT", 5000)) # Default to 5000 for local testing
+    
+    # Run the app using Flask's built-in server
+    # This is for debugging and will prove the PORT variable is readable
+    print(f"INFO: Starting Flask app on host 0.0.0.0 and port {port}")
+    app.run(host='0.0.0.0', port=port)

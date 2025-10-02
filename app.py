@@ -82,9 +82,12 @@ def generate_and_stream_tts(ws, text_to_speak: str, stream_sid: str):
         audio = AudioSegment.from_mp3(mp3_data)
         audio = audio.set_frame_rate(SAMPLE_RATE).set_channels(1)
         
-        # Twilio Media Streams expect µ-law encoded audio data, which pydub handles
-        # by returning the raw bytes of the correct format.
-        mulaw_data = audio.raw_data
+        # Twilio Media Streams expect µ-law encoded audio data.
+        # pydub's .raw_data gives us the raw PCM data, which we then need to encode.
+        # For µ-law, pydub handles this internally when exporting.
+        output_buffer = BytesIO()
+        audio.export(output_buffer, format="mulaw")
+        mulaw_data = output_buffer.getvalue()
         
         encoded_data = base64.b64encode(mulaw_data).decode('utf-8')
         
@@ -120,6 +123,7 @@ def voice_webhook():
     """Handles incoming calls from Twilio and connects them to the websocket."""
     response = VoiceResponse()
     connect = Connect()
+    response.say("שלום, אני מאזין.", voice="Polly.Aditi", language="he-IL")
     connect.stream(url=TWILIO_WEBSOCKET_URL)
     response.append(connect)
     response.pause(length=120)
@@ -127,17 +131,22 @@ def voice_webhook():
     return str(response), 200, {'Content-Type': 'application/xml'}
 
 @app.route('/stream')
-def stream_websocket(ws):
-    """Handles the bidirectional websocket communication."""
+def stream_websocket():
+    """Handles the bidirectional websocket communication using gevent-websocket."""
+    ws = request.environ.get('wsgi.websocket')
+    if not ws:
+        logger.error("Expected a websocket connection but none was found.")
+        return "Expected a websocket connection", 400
+
     if not speech_client or not elevenlabs_client:
         logger.error("API clients not initialized. Closing websocket.")
+        if not ws.closed:
+             ws.close()
         return ""
 
     stream_sid = None
     
-    # This generator function reads from the websocket and yields audio chunks to Google
     def request_generator(ws_local):
-        # The first request must be the configuration
         streaming_config = speech.StreamingRecognitionConfig(
             config=speech.RecognitionConfig(
                 encoding=speech.RecognitionConfig.AudioEncoding.MULAW,
@@ -145,18 +154,14 @@ def stream_websocket(ws):
                 language_code=LANGUAGE_CODE,
             ),
             interim_results=False,
-            single_utterance=True, # Stop recognizing after the first final result
+            single_utterance=True,
         )
         yield speech.StreamingRecognizeRequest(streaming_config=streaming_config)
 
-        # Now, process incoming messages
         while not ws_local.closed:
             message = ws_local.receive()
-            if message is None:
-                break
-            
+            if message is None: break
             data = json.loads(message)
-
             if data['event'] == 'start':
                 nonlocal stream_sid
                 stream_sid = data['start']['streamSid']
@@ -168,25 +173,15 @@ def stream_websocket(ws):
                 break
 
     try:
-        # The Google client's streaming_recognize is a blocking iterator.
-        # It's compatible with gevent's synchronous-style concurrency.
         responses = speech_client.streaming_recognize(requests=request_generator(ws))
-
         for response in responses:
-            if not response.results or not response.results[0].alternatives:
-                continue
-
+            if not response.results or not response.results[0].alternatives: continue
             result = response.results[0]
             if result.is_final:
                 transcript = result.alternatives[0].transcript
                 bot_response_text = simple_bot_logic(transcript)
-                
-                # After getting the transcript, generate and send the audio response.
-                # This is a blocking call, which is fine in this gevent context.
-                generate_and_stream_tts(ws, bot_response_text, stream_sid)
-                
-                # Since single_utterance=True, the Google stream will automatically close
-                # after this first final result. We break the loop to stop processing.
+                if ws and not ws.closed and stream_sid:
+                    generate_and_stream_tts(ws, bot_response_text, stream_sid)
                 break 
     except Exception as e:
         logger.error(f"Error during STT processing: {e}")
@@ -195,4 +190,4 @@ def stream_websocket(ws):
             logger.info("Closing websocket from server.")
             ws.close()
     
-    return "" # Flask-Gevent-Websocket expects a response
+    return ""

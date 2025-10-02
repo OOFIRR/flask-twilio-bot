@@ -1,183 +1,198 @@
-
 import os
 import json
 import logging
-import asyncio
 import base64
+from io import BytesIO
 
-from flask import Flask, request, Response
+from flask import Flask, request
 from twilio.twiml.voice_response import VoiceResponse, Connect
 from google.cloud import speech
-from elevenlabs.client import AsyncElevenLabs
+from elevenlabs import ElevenLabs, Voice, VoiceSettings
+from pydub import AudioSegment
 
-# --- Basic Configuration ---
+# --- 1. Basic Configuration & Logging ---
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --- GCP Credentials Setup (CRITICAL FOR RAILWAY) ---
-# This block reads the JSON credentials from an environment variable,
-# writes them to a temporary file, and points the Google Cloud library to that file.
-GCP_CREDS_JSON_STR = os.environ.get("GCP_CREDENTIALS_JSON")
-speech_client = None
-if GCP_CREDS_JSON_STR:
-    try:
-        # Create a temporary file to store the credentials
-        with open("/tmp/gcp_creds.json", "w") as f:
-            f.write(GCP_CREDS_JSON_STR)
-        # Set the environment variable that the Google Cloud library expects
-        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "/tmp/gcp_creds.json"
-        
-        # Initialize the client AFTER setting the environment variable
-        speech_client = speech.SpeechClient()
-        logger.info("GCP credentials loaded and Speech Client initialized successfully.")
-    except Exception as e:
-        logger.error(f"Failed to load GCP credentials or initialize Speech Client: {e}")
-else:
-    logger.error("GCP_CREDENTIALS_JSON environment variable not found. Speech-to-Text will not work.")
-# --- End of Credentials Setup ---
+# --- 2. Environment Variable & API Client Initialization ---
+try:
+    # GCP Credentials Setup (from JSON string in env var)
+    gcp_creds_json_str = os.environ["GCP_CREDENTIALS_JSON"]
+    creds_path = "/tmp/gcp_creds.json"
+    with open(creds_path, "w") as f:
+        f.write(gcp_creds_json_str)
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = creds_path
+    speech_client = speech.SpeechClient()
+    logger.info("Google Speech Client initialized successfully.")
 
+    # ElevenLabs Client Setup
+    elevenlabs_client = ElevenLabs(api_key=os.environ["ELEVENLABS_API_KEY"])
+    ELEVENLABS_VOICE_ID = os.environ["ELEVENLABS_VOICE_ID"]
+    logger.info("ElevenLabs Client initialized successfully.")
 
-# --- Environment Variables & Constants ---
-TWILIO_DOMAIN = os.environ.get("RAILWAY_STATIC_URL")
-if not TWILIO_DOMAIN:
-    raise ValueError("RAILWAY_STATIC_URL environment variable not set.")
-VOICE_STREAM_URL = f"wss://{TWILIO_DOMAIN}/stream"
+except KeyError as e:
+    logger.error(f"FATAL: Missing required environment variable: {e}. The application will not work.")
+    speech_client = None
+    elevenlabs_client = None
+except Exception as e:
+    logger.error(f"FATAL: Error during API client initialization: {e}. The application will not work.")
+    speech_client = None
+    elevenlabs_client = None
 
-ELEVENLABS_API_KEY = os.environ.get("ELEVENLABS_API_KEY")
-ELEVENLABS_VOICE_ID = os.environ.get("ELEVENLABS_VOICE_ID")
-if not ELEVENLABS_API_KEY or not ELEVENLABS_VOICE_ID:
-    raise ValueError("ELEVENLABS_API_KEY and ELEVENLABS_VOICE_ID environment variables must be set.")
-elevenlabs_client = AsyncElevenLabs(api_key=ELEVENLABS_API_KEY)
-
-# Google Cloud Speech-to-Text configuration
+# --- 3. Constants and App Setup ---
+TWILIO_WEBSOCKET_URL = f"wss://{os.environ.get('RAILWAY_STATIC_URL', 'your-domain.up.railway.app')}/stream"
 SAMPLE_RATE = 8000
 LANGUAGE_CODE = 'he-IL'
-recognition_config = speech.RecognitionConfig(
-    encoding=speech.RecognitionConfig.AudioEncoding.MULAW,
-    sample_rate_hertz=SAMPLE_RATE,
-    language_code=LANGUAGE_CODE,
-    model="telephony",
-    use_enhanced=True,
-)
-streaming_config = speech.StreamingRecognitionConfig(
-    config=recognition_config,
-    interim_results=False,
-    single_utterance=True
-)
 
-# --- Flask App Initialization ---
 app = Flask(__name__)
 
-# --- Core Bot Logic ---
-def handle_text_response(text: str) -> str:
-    logger.info(f"User said: '{text}'")
-    text_lower = text.lower().strip()
-    if "שלום" in text_lower or "היי" in text_lower:
-        return "שלום גם לך! אני בוט שיחה. איך אני יכול לעזור?"
-    elif "שם" in text_lower:
-        return "השם שלי הוא בוט, ואני שמח לדבר איתך."
-    else:
-        return "לא כל כך הבנתי. אפשר לנסות שוב בבקשה?"
+# --- 4. Core Bot Logic ---
 
-async def send_audio_response_to_twilio(ws, stream_sid: str, text_to_speak: str):
+def simple_bot_logic(text: str) -> str:
+    """A simple hardcoded logic for the bot's responses."""
+    logger.info(f"User said: '{text}'")
+    text_lower = text.lower()
+    if "שלום" in text_lower or "היי" in text_lower:
+        return "שלום גם לך! אני הבוט הקולי של Railway. מה שלומך?"
+    elif "שם" in text:
+        return "השם שלי הוא בוט-רכבת. נעים מאוד להכיר."
+    elif "תודה" in text_lower:
+        return "בבקשה! שמחתי לעזור."
+    else:
+        return "לא כל כך הבנתי. אפשר לנסות שוב?"
+
+def generate_and_stream_tts(ws, text_to_speak: str, stream_sid: str):
+    """Generates audio with ElevenLabs and streams it back to Twilio."""
     logger.info(f"Generating audio for: '{text_to_speak}'")
     try:
-        audio_stream = await elevenlabs_client.generate(
+        # Generate audio using a blocking call, suitable for gevent
+        response = elevenlabs_client.text_to_speech.convert(
+            voice_id=ELEVENLABS_VOICE_ID,
             text=text_to_speak,
-            voice=ELEVENLABS_VOICE_ID,
-            model="eleven_multilingual_v2",
-            stream=True,
-            output_format="mulaw_8000"
+            model_id="eleven_multilingual_v2",
+            voice_settings=VoiceSettings(stability=0.5, similarity_boost=0.75)
         )
-        async for audio_chunk in audio_stream:
-            if audio_chunk:
-                payload = base64.b64encode(audio_chunk).decode("utf-8")
-                media_message = {
-                    "event": "media",
-                    "streamSid": stream_sid,
-                    "media": {"payload": payload}
-                }
-                await ws.send(json.dumps(media_message))
+
+        mp3_data = BytesIO()
+        for chunk in response:
+            mp3_data.write(chunk)
+        mp3_data.seek(0)
+
+        # Convert MP3 to the format Twilio requires (8000Hz mono µ-law)
+        audio = AudioSegment.from_mp3(mp3_data)
+        audio = audio.set_frame_rate(SAMPLE_RATE).set_channels(1)
+        
+        # Twilio Media Streams expect µ-law encoded audio data, which pydub handles
+        # by returning the raw bytes of the correct format.
+        mulaw_data = audio.raw_data
+        
+        encoded_data = base64.b64encode(mulaw_data).decode('utf-8')
+        
+        # Send the audio back to Twilio as a media message
+        media_message = {
+            "event": "media",
+            "streamSid": stream_sid,
+            "media": {
+                "payload": encoded_data
+            }
+        }
+        ws.send(json.dumps(media_message))
+        logger.info("Sent audio media to Twilio.")
+        
+        # Send a mark message to signal that we are done speaking
         mark_message = {
             "event": "mark",
             "streamSid": stream_sid,
-            "mark": {"name": "end_of_bot_speech"}
+            "mark": {
+                "name": "bot_response_finished"
+            }
         }
-        await ws.send(json.dumps(mark_message))
-        logger.info("Finished streaming audio response.")
+        ws.send(json.dumps(mark_message))
+        logger.info("Sent 'mark' message to Twilio, signaling end of bot's turn.")
+
     except Exception as e:
         logger.error(f"Error during TTS generation or streaming: {e}")
 
-# --- WebSocket Handler ---
-async def twilio_stream_handler(ws):
-    if not speech_client:
-        logger.error("Speech client is not initialized. Cannot handle WebSocket stream.")
-        return
+# --- 5. Flask Routes ---
 
-    logger.info("WebSocket connection established.")
-    stream_sid = None
-
-    async def audio_generator_from_twilio(ws_client):
-        yield speech.StreamingRecognizeRequest(streaming_config=streaming_config)
-        while not ws_client.closed:
-            try:
-                message = await ws_client.recv()
-                data = json.loads(message)
-                if data["event"] == "start":
-                    nonlocal stream_sid
-                    stream_sid = data['start']['streamSid']
-                    logger.info(f"Twilio Start event. Stream SID: {stream_sid}")
-                elif data["event"] == "media":
-                    yield speech.StreamingRecognizeRequest(
-                        audio_content=base64.b64decode(data['media']['payload'])
-                    )
-                elif data["event"] == "stop":
-                    logger.info("Twilio Stop event received.")
-                    break
-            except Exception:
-                break
-
-    try:
-        requests = audio_generator_from_twilio(ws)
-        responses = speech_client.streaming_recognize(requests=requests)
-        for response in responses:
-            if not response.results or not response.results[0].alternatives:
-                continue
-            
-            result = response.results[0]
-            if result.is_final:
-                transcript = result.alternatives[0].transcript.strip()
-                logger.info(f"STT Final Transcript: '{transcript}'")
-                if transcript and stream_sid:
-                    bot_response_text = handle_text_response(transcript)
-                    await send_audio_response_to_twilio(ws, stream_sid, bot_response_text)
-                    break 
-    except Exception as e:
-        logger.error(f"Error during STT processing: {e}")
-    finally:
-        logger.info("Closing WebSocket connection.")
-        if not ws.closed:
-            await ws.close()
-
-# --- Flask Routes ---
 @app.route("/voice", methods=['POST'])
-def voice():
+def voice_webhook():
+    """Handles incoming calls from Twilio and connects them to the websocket."""
     response = VoiceResponse()
     connect = Connect()
-    response.say("שלום, אני מחבר אותך.", language="he-IL")
-    connect.stream(url=VOICE_STREAM_URL)
+    connect.stream(url=TWILIO_WEBSOCKET_URL)
     response.append(connect)
-    response.pause(length=60)
+    response.pause(length=120)
+    logger.info("Generated TwiML for incoming call.")
     return str(response), 200, {'Content-Type': 'application/xml'}
 
 @app.route('/stream')
-def stream():
-    if 'wsgi.websocket' in request.environ:
-        ws = request.environ['wsgi.websocket']
-        try:
-            asyncio.run(twilio_stream_handler(ws))
-        except Exception as e:
-            logger.error(f"Error in stream handler: {e}")
-        return Response(status=200)
-    else:
-        return "WebSocket connection expected.", 400
+def stream_websocket(ws):
+    """Handles the bidirectional websocket communication."""
+    if not speech_client or not elevenlabs_client:
+        logger.error("API clients not initialized. Closing websocket.")
+        return ""
+
+    stream_sid = None
+    
+    # This generator function reads from the websocket and yields audio chunks to Google
+    def request_generator(ws_local):
+        # The first request must be the configuration
+        streaming_config = speech.StreamingRecognitionConfig(
+            config=speech.RecognitionConfig(
+                encoding=speech.RecognitionConfig.AudioEncoding.MULAW,
+                sample_rate_hertz=SAMPLE_RATE,
+                language_code=LANGUAGE_CODE,
+            ),
+            interim_results=False,
+            single_utterance=True, # Stop recognizing after the first final result
+        )
+        yield speech.StreamingRecognizeRequest(streaming_config=streaming_config)
+
+        # Now, process incoming messages
+        while not ws_local.closed:
+            message = ws_local.receive()
+            if message is None:
+                break
+            
+            data = json.loads(message)
+
+            if data['event'] == 'start':
+                nonlocal stream_sid
+                stream_sid = data['start']['streamSid']
+                logger.info(f"Stream started: {stream_sid}")
+            elif data['event'] == 'media':
+                yield speech.StreamingRecognizeRequest(audio_content=base64.b64decode(data['media']['payload']))
+            elif data['event'] == 'stop':
+                logger.info("Stream stopped by Twilio.")
+                break
+
+    try:
+        # The Google client's streaming_recognize is a blocking iterator.
+        # It's compatible with gevent's synchronous-style concurrency.
+        responses = speech_client.streaming_recognize(requests=request_generator(ws))
+
+        for response in responses:
+            if not response.results or not response.results[0].alternatives:
+                continue
+
+            result = response.results[0]
+            if result.is_final:
+                transcript = result.alternatives[0].transcript
+                bot_response_text = simple_bot_logic(transcript)
+                
+                # After getting the transcript, generate and send the audio response.
+                # This is a blocking call, which is fine in this gevent context.
+                generate_and_stream_tts(ws, bot_response_text, stream_sid)
+                
+                # Since single_utterance=True, the Google stream will automatically close
+                # after this first final result. We break the loop to stop processing.
+                break 
+    except Exception as e:
+        logger.error(f"Error during STT processing: {e}")
+    finally:
+        if not ws.closed:
+            logger.info("Closing websocket from server.")
+            ws.close()
+    
+    return "" # Flask-Gevent-Websocket expects a response

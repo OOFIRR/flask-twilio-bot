@@ -16,7 +16,6 @@ logger = logging.getLogger(__name__)
 
 # --- 2. Environment Variable & API Client Initialization ---
 try:
-    # GCP Credentials Setup (from JSON string in env var)
     gcp_creds_json_str = os.environ["GCP_CREDENTIALS_JSON"]
     creds_path = "/tmp/gcp_creds.json"
     with open(creds_path, "w") as f:
@@ -25,7 +24,6 @@ try:
     speech_client = speech.SpeechClient()
     logger.info("Google Speech Client initialized successfully.")
 
-    # ElevenLabs Client Setup
     elevenlabs_client = ElevenLabs(api_key=os.environ["ELEVENLABS_API_KEY"])
     ELEVENLABS_VOICE_ID = os.environ["ELEVENLABS_VOICE_ID"]
     logger.info("ElevenLabs Client initialized successfully.")
@@ -49,7 +47,6 @@ app = Flask(__name__)
 # --- 4. Core Bot Logic ---
 
 def simple_bot_logic(text: str) -> str:
-    """A simple hardcoded logic for the bot's responses."""
     logger.info(f"User said: '{text}'")
     text_lower = text.lower()
     if "שלום" in text_lower or "היי" in text_lower:
@@ -62,10 +59,8 @@ def simple_bot_logic(text: str) -> str:
         return "לא כל כך הבנתי. אפשר לנסות שוב?"
 
 def generate_and_stream_tts(ws, text_to_speak: str, stream_sid: str):
-    """Generates audio with ElevenLabs and streams it back to Twilio."""
     logger.info(f"Generating audio for: '{text_to_speak}'")
     try:
-        # Generate audio using a blocking call, suitable for gevent
         response = elevenlabs_client.text_to_speech.convert(
             voice_id=ELEVENLABS_VOICE_ID,
             text=text_to_speak,
@@ -78,20 +73,15 @@ def generate_and_stream_tts(ws, text_to_speak: str, stream_sid: str):
             mp3_data.write(chunk)
         mp3_data.seek(0)
 
-        # Convert MP3 to the format Twilio requires (8000Hz mono µ-law)
         audio = AudioSegment.from_mp3(mp3_data)
         audio = audio.set_frame_rate(SAMPLE_RATE).set_channels(1)
         
-        # Twilio Media Streams expect µ-law encoded audio data.
-        # pydub's .raw_data gives us the raw PCM data, which we then need to encode.
-        # For µ-law, pydub handles this internally when exporting.
         output_buffer = BytesIO()
         audio.export(output_buffer, format="mulaw")
         mulaw_data = output_buffer.getvalue()
         
         encoded_data = base64.b64encode(mulaw_data).decode('utf-8')
         
-        # Send the audio back to Twilio as a media message
         media_message = {
             "event": "media",
             "streamSid": stream_sid,
@@ -102,7 +92,6 @@ def generate_and_stream_tts(ws, text_to_speak: str, stream_sid: str):
         ws.send(json.dumps(media_message))
         logger.info("Sent audio media to Twilio.")
         
-        # Send a mark message to signal that we are done speaking
         mark_message = {
             "event": "mark",
             "streamSid": stream_sid,
@@ -123,7 +112,9 @@ def voice_webhook():
     """Handles incoming calls from Twilio and connects them to the websocket."""
     response = VoiceResponse()
     connect = Connect()
-    response.say("שלום, אני מאזין.", voice="Polly.Aditi", language="he-IL")
+    # CRITICAL FIX: Removed the invalid 'voice' attribute.
+    # We now only specify the language, letting Twilio use its default, high-quality Hebrew voice.
+    response.say("שלום, אני מאזין.", language="he-IL")
     connect.stream(url=TWILIO_WEBSOCKET_URL)
     response.append(connect)
     response.pause(length=120)
@@ -132,7 +123,6 @@ def voice_webhook():
 
 @app.route('/stream')
 def stream_websocket():
-    """Handles the bidirectional websocket communication using gevent-websocket."""
     ws = request.environ.get('wsgi.websocket')
     if not ws:
         logger.error("Expected a websocket connection but none was found.")

@@ -29,7 +29,6 @@ LANGUAGE_CODE = "he-IL"
 app = Flask(__name__)
 Talisman(app, content_security_policy=None)
 
-
 # --- Google Credentials ---
 def load_gcp_credentials():
     try:
@@ -72,15 +71,10 @@ def voice():
 # --- WebSocket Route ---
 @app.route("/stream")
 def stream():
-    @app.route("/stream")
-def stream():
     logger.info("🔌 /stream endpoint was called")
 
     if request.environ.get("wsgi.websocket"):
         logger.info("✅ WebSocket upgrade successful")
-        ws = request.environ["wsgi.websocket"]
-
-    if request.environ.get("wsgi.websocket"):
         ws = request.environ["wsgi.websocket"]
         logger.info("WebSocket connected.")
 

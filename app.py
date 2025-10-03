@@ -29,6 +29,7 @@ LANGUAGE_CODE = "he-IL"
 app = Flask(__name__)
 Talisman(app, content_security_policy=None)
 
+
 # --- Google Credentials ---
 def load_gcp_credentials():
     try:
@@ -152,7 +153,7 @@ def stream():
             logger.info("WebSocket closed.")
 
     else:
-        logger.warning("Non-WebSocket request to /stream")
+        logger.warning("❌ Non-WebSocket request to /stream")
         return "This endpoint is for WebSocket only", 400
 
 # --- Main Entry ---

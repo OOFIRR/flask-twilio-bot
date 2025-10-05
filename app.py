@@ -9,6 +9,7 @@ from google.cloud import speech
 from elevenlabs.client import ElevenLabs
 from pydub import AudioSegment
 from io import BytesIO
+import tempfile # ייבוא חדש עבור קבצים זמניים
 
 from gevent import pywsgi
 from geventwebsocket.handler import WebSocketHandler
@@ -29,35 +30,31 @@ LANGUAGE_CODE = "he-IL"
 app = Flask(__name__)
 Talisman(app, content_security_policy=None)
 
-
 # --- Google Credentials ---
 def load_gcp_credentials():
-    gcp_creds_file = "gcp_creds.json"
+    global _gcp_creds_file_path # משתנה גלובלי לשמירת הנתיב לקובץ הזמני
+    _gcp_creds_file_path = None # אתחול
+
     try:
         if not GCP_CREDENTIALS_JSON:
-            logger.error("GCP_CREDENTIALS_JSON environment variable is not set.")
+            logger.critical("GCP_CREDENTIALS_JSON environment variable is not set. Cannot proceed with GCP authentication.")
             return False
 
-        creds = json.loads(GCP_CREDENTIALS_JSON)
-        with open(gcp_creds_file, "w") as f:
-            json.dump(creds, f)
-        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = gcp_creds_file
-        logger.info("GCP credentials loaded and GOOGLE_APPLICATION_CREDENTIALS set.")
+        # יצירת קובץ זמני עם tempfile כדי לנהל אותו באופן בטוח יותר
+        with tempfile.NamedTemporaryFile(mode='w', delete=False, encoding='utf-8') as temp_creds_file:
+            temp_creds_file.write(GCP_CREDENTIALS_JSON)
+            _gcp_creds_file_path = temp_creds_file.name
+        
+        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = _gcp_creds_file_path
+        logger.info(f"GCP credentials written to temporary file: {_gcp_creds_file_path} and GOOGLE_APPLICATION_CREDENTIALS set.")
+        logger.info(f"Verifying temporary file existence: {os.path.exists(_gcp_creds_file_path)}")
         return True
     except json.JSONDecodeError as e:
-        logger.error(f"Error decoding GCP_CREDENTIALS_JSON: {e}", exc_info=True)
+        logger.critical(f"Error decoding GCP_CREDENTIALS_JSON: {e}. Check its content for valid JSON.", exc_info=True)
         return False
     except Exception as e:
-        logger.error(f"Error loading GCP credentials: {e}", exc_info=True)
+        logger.critical(f"Critical error during GCP credentials loading: {e}", exc_info=True)
         return False
-    finally:
-        # Clean up the temporary credentials file
-        if os.path.exists(gcp_creds_file):
-            try:
-                os.remove(gcp_creds_file)
-                logger.info(f"Temporary GCP credentials file '{gcp_creds_file}' removed.")
-            except Exception as e:
-                logger.warning(f"Could not remove temporary GCP credentials file: {e}")
 
 
 # --- Clients ---
@@ -69,8 +66,12 @@ def init_clients():
         logger.critical("Failed to load GCP credentials. Speech-to-Text will not work.")
         speech_client = None # Set to None to indicate failure
     else:
-        speech_client = speech.SpeechClient()
-        logger.info("Google Cloud Speech client initialized.")
+        try:
+            speech_client = speech.SpeechClient()
+            logger.info("Google Cloud Speech client initialized successfully.")
+        except Exception as e:
+            logger.critical(f"Failed to initialize Google Cloud Speech client AFTER loading credentials: {e}", exc_info=True)
+            speech_client = None
 
     if not ELEVENLABS_API_KEY:
         logger.critical("ELEVENLABS_API_KEY environment variable is not set. Text-to-Speech will not work.")
@@ -80,6 +81,15 @@ def init_clients():
         logger.info("ElevenLabs client initialized.")
 
 init_clients()
+
+# --- Cleanup function for temporary GCP credentials file ---
+def cleanup_gcp_creds_file():
+    if '_gcp_creds_file_path' in globals() and _gcp_creds_file_path and os.path.exists(_gcp_creds_file_path):
+        try:
+            os.remove(_gcp_creds_file_path)
+            logger.info(f"Temporary GCP credentials file '{_gcp_creds_file_path}' removed.")
+        except Exception as e:
+            logger.warning(f"Could not remove temporary GCP credentials file '{_gcp_creds_file_path}': {e}")
 
 # --- Bot Logic ---
 def get_bot_response(text):
@@ -95,9 +105,6 @@ def get_bot_response(text):
 def voice():
     response = VoiceResponse()
     connect = Connect()
-    # חשוב: וודא שכתובת ה-URL הזו תואמת בדיוק לדומיין הציבורי של האפליקציה שלך ב-Railway
-    # הכתובת מתוך הקוד המקורי שלך: "wss://web-production-770fa.up.railway.app/stream"
-    # יש לוודא שהיא נכונה לדומיין שלך
     stream_url = os.environ.get("WEBSOCKET_STREAM_URL", "wss://web-production-770fa.up.railway.app/stream")
     connect.stream(url=stream_url)
     response.append(connect)
@@ -151,7 +158,6 @@ def stream():
                     elif data.get("event") == "stop":
                         logger.info(f"Twilio 'stop' event received: {data}")
                         break # Stop generator when Twilio signals stop
-                    # Ignore other event types like "mark"
                 except json.JSONDecodeError as e:
                     logger.error(f"JSON Decode Error in WebSocket message: {e}", exc_info=True)
                     break
@@ -246,3 +252,5 @@ if __name__ == "__main__":
         server.serve_forever()
     except Exception as e:
         logger.critical(f"Failed to start WSGIServer: {e}", exc_info=True)
+    finally:
+        cleanup_gcp_creds_file() # Ensure temporary file is cleaned up on exit

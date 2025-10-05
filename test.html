@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html>
+  <body>
+    <script>
+      const socket = new WebSocket("wss://web-production-770fa.up.railway.app/stream");
+
+      socket.onopen = () => {
+        console.log("✅ Connected");
+
+        // שלח הודעת התחלה כמו ש-Twilio עושה
+        socket.send(JSON.stringify({
+          event: "start",
+          streamSid: "test",
+          start: {
+            sampleRate: 8000
+          }
+        }));
+
+        // שלח הודעת media מדומה (base64 של אודיו ריק)
+        setTimeout(() => {
+          const emptyAudioBase64 = btoa(String.fromCharCode(...new Uint8Array(160)));  // 20ms של אודיו μ-law ריק
+          socket.send(JSON.stringify({
+            event: "media",
+            streamSid: "test",
+            media: {
+              payload: emptyAudioBase64
+            }
+          }));
+          console.log("📤 Sent mock media");
+        }, 1000);
+      };
+
+      socket.onmessage = (event) => {
+        console.log("📥 Message from server:", event.data);
+      };
+
+      socket.onerror = (e) => {
+        console.error("❌ Error", e);
+      };
+
+      socket.onclose = () => {
+        console.warn("🔌 Closed");
+      };
+    </script>
+  </body>
+</html>

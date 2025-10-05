@@ -32,21 +32,52 @@ Talisman(app, content_security_policy=None)
 
 # --- Google Credentials ---
 def load_gcp_credentials():
+    gcp_creds_file = "gcp_creds.json"
     try:
+        if not GCP_CREDENTIALS_JSON:
+            logger.error("GCP_CREDENTIALS_JSON environment variable is not set.")
+            return False
+
         creds = json.loads(GCP_CREDENTIALS_JSON)
-        with open("gcp_creds.json", "w") as f:
+        with open(gcp_creds_file, "w") as f:
             json.dump(creds, f)
-        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "gcp_creds.json"
-        logger.info("GCP credentials loaded.")
+        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = gcp_creds_file
+        logger.info("GCP credentials loaded and GOOGLE_APPLICATION_CREDENTIALS set.")
+        return True
+    except json.JSONDecodeError as e:
+        logger.error(f"Error decoding GCP_CREDENTIALS_JSON: {e}", exc_info=True)
+        return False
     except Exception as e:
-        logger.error(f"Error loading GCP credentials: {e}")
+        logger.error(f"Error loading GCP credentials: {e}", exc_info=True)
+        return False
+    finally:
+        # Clean up the temporary credentials file
+        if os.path.exists(gcp_creds_file):
+            try:
+                os.remove(gcp_creds_file)
+                logger.info(f"Temporary GCP credentials file '{gcp_creds_file}' removed.")
+            except Exception as e:
+                logger.warning(f"Could not remove temporary GCP credentials file: {e}")
+
 
 # --- Clients ---
 def init_clients():
     global speech_client, elevenlabs_client
-    load_gcp_credentials()
-    speech_client = speech.SpeechClient()
-    elevenlabs_client = ElevenLabs(api_key=ELEVENLABS_API_KEY)
+    logger.info("Initializing Google Cloud Speech and ElevenLabs clients...")
+    
+    if not load_gcp_credentials():
+        logger.critical("Failed to load GCP credentials. Speech-to-Text will not work.")
+        speech_client = None # Set to None to indicate failure
+    else:
+        speech_client = speech.SpeechClient()
+        logger.info("Google Cloud Speech client initialized.")
+
+    if not ELEVENLABS_API_KEY:
+        logger.critical("ELEVENLABS_API_KEY environment variable is not set. Text-to-Speech will not work.")
+        elevenlabs_client = None # Set to None to indicate failure
+    else:
+        elevenlabs_client = ElevenLabs(api_key=ELEVENLABS_API_KEY)
+        logger.info("ElevenLabs client initialized.")
 
 init_clients()
 
@@ -64,22 +95,32 @@ def get_bot_response(text):
 def voice():
     response = VoiceResponse()
     connect = Connect()
-    connect.stream(url="wss://web-production-770fa.up.railway.app/stream")
+    # חשוב: וודא שכתובת ה-URL הזו תואמת בדיוק לדומיין הציבורי של האפליקציה שלך ב-Railway
+    # הכתובת מתוך הקוד המקורי שלך: "wss://web-production-770fa.up.railway.app/stream"
+    # יש לוודא שהיא נכונה לדומיין שלך
+    stream_url = os.environ.get("WEBSOCKET_STREAM_URL", "wss://web-production-770fa.up.railway.app/stream")
+    connect.stream(url=stream_url)
     response.append(connect)
-    logger.info("Generated TwiML for call.")
+    logger.info(f"Generated TwiML for call with stream URL: {stream_url}")
     return str(response), 200, {"Content-Type": "application/xml"}
 
 # --- WebSocket Route ---
 @app.route("/stream")
 def stream():
-    logger.info("🔌 /stream endpoint was called")
+    logger.info("🔌 /stream endpoint was called.")
 
     if request.environ.get("wsgi.websocket"):
-        logger.info("✅ WebSocket upgrade successful")
+        logger.info("✅ WebSocket upgrade successful. Attempting to connect.")
         ws = request.environ["wsgi.websocket"]
         logger.info("WebSocket connected.")
 
         stream_sid = request.environ.get("HTTP_X_TWILIO_STREAM_SID", "unknown_sid")
+        logger.info(f"Stream SID: {stream_sid}")
+
+        if speech_client is None:
+            logger.error("Speech client is not initialized. Cannot perform speech recognition.")
+            ws.close()
+            return "Speech client not ready", 500
 
         recognition_config = speech.RecognitionConfig(
             encoding=speech.RecognitionConfig.AudioEncoding.MULAW,
@@ -91,29 +132,56 @@ def stream():
             interim_results=False,
             single_utterance=True,
         )
+        logger.info("Google Speech Recognition config set.")
 
         def request_generator():
+            logger.info("Starting WebSocket request generator...")
             while not ws.closed:
-                message = ws.receive()
-                if message is None:
+                try:
+                    message = ws.receive()
+                    if message is None:
+                        logger.warning("Received None message from WebSocket (client disconnected?). Breaking generator.")
+                        break
+                    data = json.loads(message)
+                    if data.get("event") == "media":
+                        audio = base64.b64decode(data["media"]["payload"])
+                        yield speech.StreamingRecognizeRequest(audio_content=audio)
+                    elif data.get("event") == "start":
+                        logger.info(f"Twilio 'start' event received: {data}")
+                    elif data.get("event") == "stop":
+                        logger.info(f"Twilio 'stop' event received: {data}")
+                        break # Stop generator when Twilio signals stop
+                    # Ignore other event types like "mark"
+                except json.JSONDecodeError as e:
+                    logger.error(f"JSON Decode Error in WebSocket message: {e}", exc_info=True)
                     break
-                data = json.loads(message)
-                if data.get("event") == "media":
-                    audio = base64.b64decode(data["media"]["payload"])
-                    yield speech.StreamingRecognizeRequest(audio_content=audio)
+                except Exception as e:
+                    logger.error(f"Unexpected error in WebSocket request generator: {e}", exc_info=True)
+                    break
+            logger.info("WebSocket request generator finished.")
 
         try:
+            logger.info("Calling speech_client.streaming_recognize...")
             responses = speech_client.streaming_recognize(streaming_config, request_generator())
+            logger.info("Speech client streaming recognize started.")
+
             for response in responses:
+                logger.info(f"Received speech recognition response: {response}")
                 if not response.results or not response.results[0].alternatives:
+                    logger.debug("No speech results or alternatives found in response.")
                     continue
 
                 result = response.results[0]
                 if result.is_final:
                     transcript = result.alternatives[0].transcript
+                    logger.info(f"Final transcript received: '{transcript}'")
                     bot_response = get_bot_response(transcript)
 
-                    logger.info(f"TTS: {bot_response}")
+                    if elevenlabs_client is None:
+                        logger.error("ElevenLabs client is not initialized. Cannot perform Text-to-Speech.")
+                        break
+
+                    logger.info(f"Generating TTS for: '{bot_response}'")
                     audio_stream = elevenlabs_client.generate(
                         text=bot_response,
                         voice=ELEVENLABS_VOICE_ID,
@@ -121,39 +189,48 @@ def stream():
                         stream=True,
                         output_format="pcm_16000"
                     )
+                    logger.info("ElevenLabs audio stream started.")
 
-                    # Notify Twilio
+                    # Notify Twilio that bot response is starting
                     ws.send(json.dumps({
                         "event": "mark",
                         "streamSid": stream_sid,
                         "mark": {"name": "bot_response_start"}
                     }))
+                    logger.info("Sent 'mark' event to Twilio.")
 
                     for chunk in audio_stream:
                         if chunk:
-                            audio = AudioSegment(
-                                data=chunk,
-                                sample_width=2,
-                                frame_rate=16000,
-                                channels=1
-                            ).set_frame_rate(SAMPLE_RATE)
-                            mulaw = audio.export(format="mulaw").read()
-                            encoded = base64.b64encode(mulaw).decode("utf-8")
-                            ws.send(json.dumps({
-                                "event": "media",
-                                "streamSid": stream_sid,
-                                "media": {"payload": encoded}
-                            }))
-                    break
+                            try:
+                                audio = AudioSegment(
+                                    data=chunk,
+                                    sample_width=2,
+                                    frame_rate=16000,
+                                    channels=1
+                                ).set_frame_rate(SAMPLE_RATE)
+                                mulaw = audio.export(format="mulaw").read()
+                                encoded = base64.b64encode(mulaw).decode("utf-8")
+                                ws.send(json.dumps({
+                                    "event": "media",
+                                    "streamSid": stream_sid,
+                                    "media": {"payload": encoded}
+                                }))
+                            except Exception as e:
+                                logger.error(f"Error processing or sending audio chunk: {e}", exc_info=True)
+                                break
+                    logger.info("Finished sending bot audio chunks.")
+                    break # Assuming single utterance interaction
 
         except Exception as e:
-            logger.error(f"WebSocket error: {e}")
+            logger.error(f"Critical WebSocket handler error: {e}", exc_info=True) # Stack trace here
         finally:
-            ws.close()
+            logger.info("WebSocket connection closing...")
+            if not ws.closed:
+                ws.close()
             logger.info("WebSocket closed.")
 
     else:
-        logger.warning("❌ Non-WebSocket request to /stream")
+        logger.warning("❌ Non-WebSocket request to /stream endpoint. This endpoint expects a WebSocket upgrade.")
         return "This endpoint is for WebSocket only", 400
 
 # --- Main Entry ---
@@ -164,4 +241,8 @@ if __name__ == "__main__":
         app,
         handler_class=WebSocketHandler
     )
-    server.serve_forever()
+    logger.info(f"WSGIServer listening on 0.0.0.0:{os.environ.get('PORT', 8080)}")
+    try:
+        server.serve_forever()
+    except Exception as e:
+        logger.critical(f"Failed to start WSGIServer: {e}", exc_info=True)
